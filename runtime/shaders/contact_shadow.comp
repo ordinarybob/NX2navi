@@ -32,6 +32,10 @@ void main() {
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
     if (px.x >= int(pc.size.x) || px.y >= int(pc.size.y)) return;
     float d = texelFetch(lin_depth, px, 0).x;
+    if (pc.opt.x > 1.5) {   // debug: the depth, 50 m to white
+        imageStore(scene, px, vec4(vec3(d * pc.proj.z / 50.0), 1.0));
+        return;
+    }
     if (d <= 0.0 || d >= 0.999) return;   // nothing drawn, or the sky
     float z = d * pc.proj.z;
     if (z > 80.0) return;
