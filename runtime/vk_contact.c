@@ -31,6 +31,7 @@
 #include "cfg.h"
 #include "contact_shadow_spv.h"
 #include "host.h"
+#include "vk_dlaa.h"
 #include "vk_exec.h"
 
 static struct {
@@ -162,7 +163,8 @@ static void march(VkExec *ex) {
     float pcv[16] = {px, py, zfar, (float)C.strength / 100.0f,
                      lx / ll, ly / ll, lz / ll, 0.6f,
                      (float)C.w, (float)C.h, 1.0f / (float)C.w, 1.0f / (float)C.h,
-                     (float)C.debug, 0, 0, 0};
+                     (float)C.debug, vk_dlaa_available() ? (float)(__atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) & 63) : 0,
+                     0, 0};
     if (!C.logged) {
         C.logged = 1;
         rt_log("vk: contact shadows on a %ux%u scene, sun toward %.3f %.3f %.3f (view space), far %g", C.w, C.h,
