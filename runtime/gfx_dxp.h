@@ -34,6 +34,15 @@ VkSemaphore dxp_copied(uint32_t idx, uint64_t *value);
 // (with sync 0): shows the frame at once. 0 when the swapchain has to be made again.
 int dxp_present(uint32_t idx, uint64_t n, int sync, int tearing);
 void dxp_metadata(float peak_nits, float frame_nits);   // HDR10: the display's peak and the picture's average
+// Frame generation (gfx_present.c fg_direct). dxp_gen_images: DXP_IMAGES more shared images of the swapchain's format,
+// one per image above, for the generated frame that goes before it; made at the first call, gone with the next
+// dxp_create. 0 on failure.
+int dxp_gen_images(VkImage imgs[DXP_IMAGES]);
+// dxp_present for a run with frame generation: a thread of this file waits for rendered = n, shows generated image idx
+// at once (gen 1; gen 0: this frame has none) and shared image idx half a frame interval later, so the two come evenly
+// spaced. Returns at once. 0 when the swapchain has to be made again.
+int dxp_present_pair(uint32_t idx, uint64_t n, int gen, int sync, int tearing);
+uint64_t dxp_presents(void);   // pictures the swapchain was given so far
 #ifdef __cplusplus
 }
 #endif
@@ -51,4 +60,10 @@ static inline int dxp_present(uint32_t idx, uint64_t n, int sync, int tearing) {
     return 0;
 }
 static inline void dxp_metadata(float peak_nits, float frame_nits) { (void)peak_nits, (void)frame_nits; }
+static inline int dxp_gen_images(VkImage *imgs) { return (void)imgs, 0; }
+static inline int dxp_present_pair(uint32_t idx, uint64_t n, int gen, int sync, int tearing) {
+    (void)idx, (void)n, (void)gen, (void)sync, (void)tearing;
+    return 0;
+}
+static inline uint64_t dxp_presents(void) { return 0; }
 #endif
