@@ -22,7 +22,7 @@
 // content only the GPU made (a render target) cannot be made again at all, it comes back empty: it waits twice the
 // hold.
 //
-// The size bound (released_cap_bytes, a quarter of the video memory budget by default) stays as the safety net it was:
+// The size bound (released_cap_bytes, a quarter of the video memory budget up to 2 GiB by default) stays as the safety net it was:
 // past it the oldest released textures go even when young. With the hold on, young ones past it are kept while the card
 // and the system have room (trl_room), up to TRL_ROOM_TIMES the bound: the old Balanced dropped 31 young ones in a
 // burst of area changes at its bound of 4 GiB on a card with 20 GiB free, and each was made again within a minute. The

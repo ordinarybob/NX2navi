@@ -2503,7 +2503,7 @@ static int idle(const Tex *e, uint64_t now);
 #define COMMIT_LOW_KEEP ((uint64_t)256 << 20)
 #define PROC_COMMIT_MIN_MB 24576
 static uint64_t released_cap;   // bytes; 0 = not read yet, UINT64_MAX = no limit
-#define RELEASED_CAP_MAX_MB 8192
+#define RELEASED_CAP_MAX_MB 2048
 static long long commit_free_mb = -2;   // -2: not read yet, -1: the default
 static long long proc_commit_mb;        // this process's bound in MB; 0 = none
 static int commit_low, commit_logs;     // commit_low: either of the two below at the last check
