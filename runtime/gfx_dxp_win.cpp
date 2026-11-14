@@ -49,11 +49,12 @@ struct Dxp {
     VkImage img[DXP_IMAGES];
     VkDeviceMemory mem[DXP_IMAGES];
     uint64_t last[DXP_IMAGES];                   // the copy (its value on f_copied) that last read the image
-    // frame generation: the generated frames' shared images, and the thread that shows a frame's two pictures
-    ID3D12Resource *gshared[DXP_IMAGES];
-    VkImage gimg[DXP_IMAGES];
-    VkDeviceMemory gmem[DXP_IMAGES];
-    ID3D12CommandAllocator *galloc[DXP_IMAGES];
+    // frame generation: the generated frames' shared images (up to DXP_GEN per shared image), and the thread that
+    // shows a frame's pictures
+    ID3D12Resource *gshared[DXP_IMAGES][DXP_GEN];
+    VkImage gimg[DXP_IMAGES][DXP_GEN];
+    VkDeviceMemory gmem[DXP_IMAGES][DXP_GEN];
+    ID3D12CommandAllocator *galloc[DXP_IMAGES][DXP_GEN];
     HANDLE th, wake, done_ev, fence_ev;
     struct Job { uint32_t idx; uint64_t n, prev; int gen, sync, tearing; } q[4];   // q_lock
     int qh, qn;                                  // q_lock: the first job (it stays queued while it runs) and their count
@@ -107,7 +108,8 @@ void release_device() {
     D.s_rendered = D.s_copied = VK_NULL_HANDLE;
     drop(D.f_rendered), drop(D.f_copied), drop(D.f_idle), drop(D.list);
     for (auto &a : D.alloc) drop(a);
-    for (auto &a : D.galloc) drop(a);
+    for (auto &row : D.galloc)
+        for (auto &a : row) drop(a);
     drop(D.queue), drop(D.dev), drop(D.factory);
     if (D.ev) CloseHandle(D.ev);
     D.ev = nullptr;
@@ -180,21 +182,25 @@ void free_images() {
         if (c && D.mem[i]) vkFreeMemory(c->device, D.mem[i], nullptr);
         D.img[i] = VK_NULL_HANDLE, D.mem[i] = VK_NULL_HANDLE, D.last[i] = 0;
         drop(D.shared[i]);
-        if (c && D.gimg[i]) vkDestroyImage(c->device, D.gimg[i], nullptr);
-        if (c && D.gmem[i]) vkFreeMemory(c->device, D.gmem[i], nullptr);
-        D.gimg[i] = VK_NULL_HANDLE, D.gmem[i] = VK_NULL_HANDLE;
-        drop(D.gshared[i]);
+        for (int k = 0; k < DXP_GEN; k++) {
+            if (c && D.gimg[i][k]) vkDestroyImage(c->device, D.gimg[i][k], nullptr);
+            if (c && D.gmem[i][k]) vkFreeMemory(c->device, D.gmem[i][k], nullptr);
+            D.gimg[i][k] = VK_NULL_HANDLE, D.gmem[i][k] = VK_NULL_HANDLE;
+            drop(D.gshared[i][k]);
+        }
     }
 }
 
-// One image of both APIs: a shared Direct3D 12 texture, and a Vulkan image on its memory.
-int make_image(VkCtx *c, VkFormat vf, ID3D12Resource **shared, VkImage *img, VkDeviceMemory *mem) {
+// One image of both APIs: a shared Direct3D 12 texture, and a Vulkan image on its memory. storage: a compute pass may
+// write it (the generated frames of DLSS Frame Generation through NGX).
+int make_image(VkCtx *c, VkFormat vf, ID3D12Resource **shared, VkImage *img, VkDeviceMemory *mem, int storage = 0) {
     D3D12_HEAP_PROPERTIES hp = {};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     rd.Width = D.w, rd.Height = D.h, rd.DepthOrArraySize = 1, rd.MipLevels = 1, rd.Format = D.fmt, rd.SampleDesc.Count = 1;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    if (storage) rd.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     HRESULT hr = D.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                 IID_PPV_ARGS(shared));
     HANDLE h = nullptr;
@@ -208,7 +214,7 @@ int make_image(VkCtx *c, VkFormat vf, ID3D12Resource **shared, VkImage *img, VkD
     // what the present does with a swapchain image: blits and clears into it, the menu draws into it, shots read it,
     // frame generation samples it
     ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-               VK_IMAGE_USAGE_SAMPLED_BIT;
+               VK_IMAGE_USAGE_SAMPLED_BIT | (storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0u);
     ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE, ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkResult r = vkCreateImage(c->device, &ci, nullptr, img);
     if (r == VK_SUCCESS) {
@@ -325,8 +331,9 @@ void wait_fence(ID3D12Fence *f, uint64_t v, DWORD ms) {   // the pair thread's
     if (f->GetCompletedValue() < v && SUCCEEDED(f->SetEventOnCompletion(v, D.fence_ev))) WaitForSingleObject(D.fence_ev, ms);
 }
 
-// One frame with frame generation: the generated picture when the frame is rendered, the rendered one half an
-// interval later (at once when another frame already waits, or with a present that waits for the refresh itself).
+// One frame with frame generation: the j.gen generated pictures and then the rendered one, spread evenly over the
+// interval between two rendered frames, the first when the frame is rendered (each at once when another frame already
+// waits, or with a present that waits for the refresh itself).
 void pair_run(const Dxp::Job &j) {
     wait_fence(D.f_copied, j.prev, 2000);     // the allocators of these images are reset: their last copies are done
     wait_fence(D.f_rendered, j.n, 2000);
@@ -335,12 +342,16 @@ void pair_run(const Dxp::Job &j) {
     D.t_last = t;
     int ok = 1;
     uint64_t t_gen = t;
-    if (j.gen) {
+    const uint64_t step = (D.ival ? D.ival : 14000000ull) / (uint64_t)(j.gen + 1);
+    uint64_t in_present = 0;   // the time the presents took (a full swapchain makes them wait)
+    for (int k = 0; k < j.gen; k++) {
         EnterCriticalSection(&dx_lock);
-        ok = copy_present(D.gshared[j.idx], D.galloc[j.idx], j.n, 0, j.sync, j.tearing);
+        const uint64_t p0 = now_ns();
+        ok &= copy_present(D.gshared[j.idx][k], D.galloc[j.idx][k], j.n, 0, j.sync, j.tearing);
+        in_present += now_ns() - p0;
         LeaveCriticalSection(&dx_lock);
-        t_gen = now_ns();
-        const uint64_t due = t_gen + (D.ival ? D.ival : 14000000ull) / 2;
+        if (!k) t_gen = now_ns();
+        const uint64_t due = t_gen + step * (uint64_t)(k + 1);
         while (!j.sync && !D.quit) {
             uint64_t now = now_ns();
             if (now >= due || D.qn > 1) break;
@@ -349,25 +360,31 @@ void pair_run(const Dxp::Job &j) {
         }
     }
     EnterCriticalSection(&dx_lock);
+    const uint64_t p1 = now_ns();
     ok &= copy_present(D.shared[j.idx], D.alloc[j.idx], j.n, 1, j.sync, j.tearing);
+    in_present += now_ns() - p1;
     if (!ok) {
         D.queue->Signal(D.f_copied, j.n);   // Vulkan's next write of these images waits for it
         InterlockedExchange(&D.failed, 1);
     }
     LeaveCriticalSection(&dx_lock);
-    // how evenly the pictures reach the swapchain: from the generated one to the rendered one, and on to the next generated one
-    static uint64_t t_prev, n, sum_a, sum_b, max_a, max_b;
+    // how evenly the pictures reach the swapchain: from the first generated one to the rendered one, and on to the next
+    // frame's first generated one
+    static uint64_t t_prev, n, sum_a, sum_b, max_a, max_b, sum_p, max_p;
     const uint64_t t_real = now_ns();
     if (j.gen && t_prev && t_gen - t_prev < 100000000ull) {
         const uint64_t a = t_real - t_gen, b = t_gen - t_prev;
-        n++, sum_a += a, sum_b += b;
+        n++, sum_a += a, sum_b += b, sum_p += in_present;
         if (a > max_a) max_a = a;
         if (b > max_b) max_b = b;
+        if (in_present > max_p) max_p = in_present;
         if (n == 1200) {
-            rt_log("dxp: generated frames: generated to rendered %.2f ms (longest %.2f), rendered to the next generated %.2f ms "
-                   "(longest %.2f), over %u frames", (double)sum_a / 1e6 / (double)n, (double)max_a / 1e6,
-                   (double)sum_b / 1e6 / (double)n, (double)max_b / 1e6, (unsigned)n);
-            n = sum_a = sum_b = max_a = max_b = 0;
+            rt_log("dxp: generated frames (%d per rendered one): first generated to rendered %.2f ms (longest %.2f), "
+                   "rendered to the next first generated %.2f ms (longest %.2f), in the presents %.2f ms a frame "
+                   "(longest %.2f), over %u frames", j.gen,
+                   (double)sum_a / 1e6 / (double)n, (double)max_a / 1e6, (double)sum_b / 1e6 / (double)n,
+                   (double)max_b / 1e6, (double)sum_p / 1e6 / (double)n, (double)max_p / 1e6, (unsigned)n);
+            n = sum_a = sum_b = max_a = max_b = sum_p = max_p = 0;
         }
     }
     t_prev = j.gen ? t_real : 0;
@@ -409,23 +426,36 @@ void pair_stop() {
 
 }   // namespace
 
-extern "C" int dxp_gen_images(VkImage imgs[DXP_IMAGES]) {
+static int gen_images(int count, VkImage imgs[DXP_IMAGES][DXP_GEN], int storage) {
     VkCtx *c = vk_ctx();
-    if (!c || !D.sc || !D.img[0]) return 0;
-    for (int i = 0; i < DXP_IMAGES; i++) {
-        if (!D.galloc[i] && FAILED(D.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&D.galloc[i])))) return 0;
-        if (!D.gimg[i] && !make_image(c, D.hdr ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : VK_FORMAT_B8G8R8A8_UNORM, &D.gshared[i],
-                                      &D.gimg[i], &D.gmem[i])) {
-            rt_log("dxp: no images for generated frames");
-            return 0;
+    if (!c || !D.sc || !D.img[0] || count < 1 || count > DXP_GEN) return 0;
+    for (int i = 0; i < DXP_IMAGES; i++)
+        for (int k = 0; k < count; k++) {
+            if (!D.galloc[i][k] && FAILED(D.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&D.galloc[i][k]))))
+                return 0;
+            if (!D.gimg[i][k] && !make_image(c, D.hdr ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : VK_FORMAT_B8G8R8A8_UNORM,
+                                             &D.gshared[i][k], &D.gimg[i][k], &D.gmem[i][k], storage)) {
+                rt_log("dxp: no images for generated frames");
+                return 0;
+            }
+            imgs[i][k] = D.gimg[i][k];
         }
-        imgs[i] = D.gimg[i];
-    }
+    return 1;
+}
+
+extern "C" int dxp_gen_images_n(int count, VkImage imgs[DXP_IMAGES][DXP_GEN]) { return gen_images(count, imgs, 1); }
+
+extern "C" int dxp_gen_images(VkImage imgs[DXP_IMAGES]) {
+    VkImage all[DXP_IMAGES][DXP_GEN];
+    if (!gen_images(1, all, 0)) return 0;
+    for (int i = 0; i < DXP_IMAGES; i++) imgs[i] = all[i][0];
     return 1;
 }
 
 extern "C" int dxp_present_pair(uint32_t idx, uint64_t n, int gen, int sync, int tearing) {
-    if (!D.sc || idx >= DXP_IMAGES || !D.shared[idx] || (gen && !D.gshared[idx])) return 0;
+    if (gen < 0) gen = 0;
+    if (gen > DXP_GEN) gen = DXP_GEN;
+    if (!D.sc || idx >= DXP_IMAGES || !D.shared[idx] || (gen && !D.gshared[idx][gen - 1])) return 0;
     if (InterlockedExchange(&D.failed, 0)) return 0;
     if (!D.th) {
         D.wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -447,6 +477,34 @@ extern "C" int dxp_present_pair(uint32_t idx, uint64_t n, int gen, int sync, int
 }
 
 extern "C" uint64_t dxp_presents(void) { return (uint64_t)D.presents; }
+
+extern "C" int dxp_hdr_elsewhere(void) {
+    HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
+    auto make_factory = dxgi ? (HRESULT(WINAPI *)(UINT, REFIID, void **))(void *)GetProcAddress(dxgi, "CreateDXGIFactory2") : nullptr;
+    IDXGIFactory6 *f = nullptr;
+    if (!make_factory || FAILED(make_factory(0, IID_PPV_ARGS(&f)))) return 0;
+    HWND w = gfx_window_handle();
+    HMONITOR mon = w ? MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST) : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    int hdr = 0, other = 0;
+    IDXGIAdapter1 *a = nullptr;
+    for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+        DXGI_ADAPTER_DESC1 ad = {};
+        a->GetDesc1(&ad);
+        IDXGIOutput *o = nullptr;
+        for (UINT j = 0; a->EnumOutputs(j, &o) != DXGI_ERROR_NOT_FOUND; j++) {
+            IDXGIOutput6 *o6 = nullptr;
+            DXGI_OUTPUT_DESC1 od;
+            if (SUCCEEDED(o->QueryInterface(IID_PPV_ARGS(&o6))) && SUCCEEDED(o6->GetDesc1(&od)) && od.Monitor == mon) {
+                hdr = od.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+                other = ad.VendorId != 0x10de;   // not NVIDIA's
+            }
+            drop(o6), drop(o);
+        }
+        drop(a);
+    }
+    drop(f);
+    return hdr && other;
+}
 
 extern "C" int dxp_hdr_display(void) {
     if (!init()) return 0;

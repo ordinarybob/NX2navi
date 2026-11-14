@@ -13,6 +13,7 @@
 #include "vk.h"
 
 #define DXP_IMAGES 3
+#define DXP_GEN 5   // generated frames per rendered one at most (DLSS Frame Generation's 6x)
 
 #ifdef _WIN32
 #ifdef __cplusplus
@@ -38,11 +39,18 @@ void dxp_metadata(float peak_nits, float frame_nits);   // HDR10: the display's 
 // one per image above, for the generated frame that goes before it; made at the first call, gone with the next
 // dxp_create. 0 on failure.
 int dxp_gen_images(VkImage imgs[DXP_IMAGES]);
-// dxp_present for a run with frame generation: a thread of this file waits for rendered = n, shows generated image idx
-// at once (gen 1; gen 0: this frame has none) and shared image idx half a frame interval later, so the two come evenly
-// spaced. Returns at once. 0 when the swapchain has to be made again.
+// The same for several generated frames per rendered one (DLSS Frame Generation through NGX, gfx_present.c dg_record):
+// count images per shared image, made as far as they are missing (count at most DXP_GEN), with storage use, so the
+// generator writes into them directly. 0 on failure.
+int dxp_gen_images_n(int count, VkImage imgs[DXP_IMAGES][DXP_GEN]);
+// dxp_present for a run with frame generation: a thread of this file waits for rendered = n, shows the gen generated
+// images of idx in order (0: this frame has none) and then shared image idx, spread evenly over the interval between
+// two rendered frames, the first at once. Returns at once. 0 when the swapchain has to be made again.
 int dxp_present_pair(uint32_t idx, uint64_t n, int gen, int sync, int tearing);
 uint64_t dxp_presents(void);   // pictures the swapchain was given so far
+// Before the Vulkan device: 1 when the display the window is on (the primary one without a window) shows HDR10 now and
+// is driven by an adapter that is not NVIDIA's, which is where the presenter carries HDR (vk_dlaa.c vk_ngxfg_wanted).
+int dxp_hdr_elsewhere(void);
 #ifdef __cplusplus
 }
 #endif
@@ -61,6 +69,8 @@ static inline int dxp_present(uint32_t idx, uint64_t n, int sync, int tearing) {
 }
 static inline void dxp_metadata(float peak_nits, float frame_nits) { (void)peak_nits, (void)frame_nits; }
 static inline int dxp_gen_images(VkImage *imgs) { return (void)imgs, 0; }
+static inline int dxp_gen_images_n(int count, VkImage imgs[DXP_IMAGES][DXP_GEN]) { return (void)count, (void)imgs, 0; }
+static inline int dxp_hdr_elsewhere(void) { return 0; }
 static inline int dxp_present_pair(uint32_t idx, uint64_t n, int gen, int sync, int tearing) {
     (void)idx, (void)n, (void)gen, (void)sync, (void)tearing;
     return 0;

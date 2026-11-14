@@ -284,6 +284,7 @@ static VkImageView g_fgx_view;
 static uint32_t g_fgx_w, g_fgx_h;
 static int g_flip_pair, g_flip_gen;
 static void fg_direct_free(VkCtx *c);
+static void dg_free(VkCtx *c);   // DLSS Frame Generation's views of the presenter's images (dg_record)
 static int g_hdr_was = -1;   // the kind of the last swapchain: the log says when a later one is of the other kind
 
 // ---- NX2NAVI_FLIGHT thumbnails (flight.c; g_pl): each present also blits the swapchain image down into slot frame % g_th_n
@@ -1261,12 +1262,21 @@ static VkImageView g_hl_view;
 static uint32_t g_hl_w, g_hl_h;
 static VkFormat g_hl_fmt;
 
+// DLSS Frame Generation through NGX into the DXGI presenter (dg_record) is set now
+static int dg_wanted(void) { return g_dx && vk_ngxfg_on(); }
+
+// Frames on screen per game frame through NGX's frame generation (dg_record, ng_record) as the last present had it; 1
+// while it generates none (gfx_ngxfg_multiplier, frame_rate.c)
+static int g_ngx_shown = 1;
+int gfx_ngxfg_multiplier(void) { return __atomic_load_n(&g_ngx_shown, __ATOMIC_RELAXED); }
+
 static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, const int rect[4], const int to[4], int general) {
     VkImage pic;
     VkImageView pv;
     uint32_t pw, ph;
     VkFormat pf;
-    if (!(vk_fg_active() || ng_running() || (g_dx && vk_fg_direct_ok())) || !vk_dlaa_fg_hudless(&pic, &pv, &pw, &ph, &pf) ||
+    if (!(vk_fg_active() || ng_running() || (g_dx && vk_fg_direct_ok()) || dg_wanted()) ||
+        !vk_dlaa_fg_hudless(&pic, &pv, &pw, &ph, &pf) ||
         !pw || !ph || w <= 0 || h <= 0)
         return VK_NULL_HANDLE;
     // The upscaler's output can be smaller than the presented picture: the scene is 75% of it in handheld mode
@@ -1337,6 +1347,7 @@ static void fg_direct_free(VkCtx *c) {   // the device idle
     if (g_fgx) vmaDestroyImage(c->vma, g_fgx, g_fgx_mem);
     g_fgo = g_fgx = VK_NULL_HANDLE, g_fgo_view = g_fgx_view = VK_NULL_HANDLE;
     g_dxg = 0;   // the presenter frees its images with its next swapchain
+    dg_free(c);
 }
 
 // The HUD of the rendered frame into the generated one, for the game's own HDR picture (shaders/fg_hudmask.comp).
@@ -1421,8 +1432,9 @@ static int fg_hud_inputs(VkCtx *c, VkImageView *pre_view, VkImage *post, const c
     return 1;
 }
 
-// dst (the rendered frame) and g_fgo (the generated one) are in GENERAL.
-static void fg_hud_keep(VkCommandBuffer cb, VkImageView dst_view, VkImageView pre_view, VkImage post, const int to[4]) {
+// The game's last pass's picture into g_fgx, which the HUD pass compares with the picture before the HUD (once a frame,
+// before fg_hud_apply).
+static void fg_hud_post(VkCommandBuffer cb, VkImage post) {
     const VkAccessFlags2 rw = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
     sync_barrier(cb, g_fgx, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, rw,
                  VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
@@ -1431,8 +1443,14 @@ static void fg_hud_keep(VkCommandBuffer cb, VkImageView dst_view, VkImageView pr
     vkCmdBlitImage(cb, post, VK_IMAGE_LAYOUT_GENERAL, g_fgx, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
     sync_barrier(cb, g_fgx, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
                  VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+}
+
+// The rendered frame's HUD into the generated frame out (GENERAL, storage use); dst (the rendered frame) is in GENERAL.
+static void fg_hud_apply(VkCommandBuffer cb, VkImageView dst_view, VkImageView pre_view, VkImage out, VkImageView out_view,
+                         const int to[4]) {
+    const VkAccessFlags2 rw = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
     VkDescriptorImageInfo im[4] = {{HM.sampler, pre_view, VK_IMAGE_LAYOUT_GENERAL}, {HM.sampler, g_fgx_view, VK_IMAGE_LAYOUT_GENERAL},
-                                   {HM.sampler, dst_view, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, g_fgo_view, VK_IMAGE_LAYOUT_GENERAL}};
+                                   {HM.sampler, dst_view, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL}};
     VkWriteDescriptorSet wr[4];
     for (int i = 0; i < 4; i++)
         wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = (uint32_t)i, .descriptorCount = 1,
@@ -1445,8 +1463,14 @@ static void fg_hud_keep(VkCommandBuffer cb, VkImageView dst_view, VkImageView pr
     HM.push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, HM.layout, 0, 4, wr);
     vkCmdPushConstants(cb, HM.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vkCmdDispatch(cb, (g_sc_ext.width + 7) / 8, (g_sc_ext.height + 7) / 8, 1);
-    sync_barrier(cb, g_fgo, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+    sync_barrier(cb, out, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                  VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, rw);
+}
+
+// dst (the rendered frame) and g_fgo (the generated one) are in GENERAL.
+static void fg_hud_keep(VkCommandBuffer cb, VkImageView dst_view, VkImageView pre_view, VkImage post, const int to[4]) {
+    fg_hud_post(cb, post);
+    fg_hud_apply(cb, dst_view, pre_view, g_fgo, g_fgo_view, to);
 }
 
 static int fg_direct(VkCtx *c, VkCommandBuffer cb, uint32_t idx, VkImage dst, int scene, VkImage hudless, const int to[4],
@@ -1747,7 +1771,7 @@ static int ng_image(NgImg *im, uint32_t w, uint32_t h, VkFormat f) {
 static int ng_ready(void) {
     if (!vk_ngxfg_wanted()) return 0;   // the Windows build, or a run that started without DLSS upscaling
     int want = vk_ngxfg_on() && !g_sc_hdr && !g_dx && !vk_fg_active() && !vk_dlssg_active();
-    if (!vk_fg_wanted()) vk_dlaa_hudless_wanted = want;   // the HUD-less picture DLSS-G tells the HUD apart by
+    if (!vk_fg_wanted() && !g_dx) vk_dlaa_hudless_wanted = want;   // the HUD-less picture DLSS-G tells the HUD apart by
     if (!want) {   // off (the menu switched it off live): what the presenter holds goes out first
         if (ng.on) ng_drain(), ng.on = 0, rt_log("ngxfg: frame generation off");
         return 0;
@@ -1918,6 +1942,133 @@ static void ng_hand(uint32_t idx, int count, int set, uint64_t n) {
     ng.pending = 1;
     plat_cond_broadcast(&ng.cv);
     plat_mutex_unlock(&ng.m);
+}
+
+// ---------------------------------------------------------------- DLSS Frame Generation through NGX into the DXGI presenter
+// Windows with HDR10 through the DXGI presenter (vk_dlaa.c vk_ngxfg_wanted): there is no Vulkan swapchain for
+// Streamline to take over, so the present generates the frames itself, as it does for AMD's (fg_direct). After the
+// picture is complete in the presenter's image dst, DLSS Frame Generation writes the multiplier less one frames between
+// it and the one before straight into the presenter's images for generated frames of the same index
+// (dxp_gen_images_n), and the presenter's thread shows them in order, then dst, spread over the interval between two
+// rendered frames (dxp_present_pair). The game's own HDR picture has no picture without the HUD: the frames are
+// generated from the whole picture and each gets the rendered frame's HUD afterwards (fg_hud_apply), as AMD's do.
+// The generated images are made as the multiplier asks for them, so a lower multiplier holds less memory.
+static struct {
+    int have;                                  // generated images per shared image made so far (dxp_gen_images_n)
+    VkImage img[DXP_IMAGES][DXP_GEN];
+    VkImageView view[DXP_IMAGES][DXP_GEN];
+    NgImg real;                                // DLSS-G's own copy of the rendered frame (OutputReal), not shown
+    int failed;                                // the presenter's images could not be made: off for this run
+    uint64_t last_t;                           // when the last frame with a picture was recorded
+} dg;
+
+static void dg_free(VkCtx *c) {   // the device idle; the presenter frees its images with its next swapchain
+    for (int i = 0; i < DXP_IMAGES; i++)
+        for (int k = 0; k < DXP_GEN; k++) {
+            if (dg.view[i][k]) vkDestroyImageView(c->device, dg.view[i][k], NULL);
+            dg.view[i][k] = VK_NULL_HANDLE, dg.img[i][k] = VK_NULL_HANDLE;
+        }
+    if (dg.real.img) ng_free_image(&dg.real);
+    dg.have = 0;
+}
+
+// After the frame's picture is complete in dst (the presenter's image idx, in *last): the generated frames into the
+// presenter's images. 1: the frame goes out through the pair thread, *gen of them before it; 0: the plain way.
+static int dg_record(VkCtx *c, VkCommandBuffer cb, uint32_t idx, VkImage dst, int scene, VkImage hudless, const int to[4],
+                     VkImageLayout *last, VkPipelineStageFlags2 *last_stage, VkAccessFlags2 *last_write, int *gen) {
+    *gen = 0;
+    if (!dg_wanted() || dg.failed) return 0;
+    const VkAccessFlags2 rw = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    const uint32_t w = g_sc_ext.width, h = g_sc_ext.height;
+    if (scene) {   // the interval between rendered frames, for the dynamic multiplier (ng_multiplier)
+        uint64_t t = plat_now_ns();
+        if (dg.last_t && t > dg.last_t) {
+            uint64_t d = t - dg.last_t;
+            if (d > 2000000ull && d < 100000000ull) ng.interval = ng.interval ? (ng.interval * 7 + d) / 8 : d;
+        }
+        dg.last_t = t;
+    }
+    int want = scene && !menu_is_open() ? ng_multiplier(vk_ngxfg_max()) - 1 : 0;
+    if (want > DXP_GEN) want = DXP_GEN;
+    if (want > dg.have) {
+        VkImage imgs[DXP_IMAGES][DXP_GEN];
+        if (!dxp_gen_images_n(want, imgs)) {
+            dg.failed = 1;
+            rt_log("ngxfg: no presenter images for %d generated frames: frame generation off", want);
+            return 0;
+        }
+        for (int i = 0; i < DXP_IMAGES; i++)
+            for (int k = dg.have; k < want; k++) {
+                dg.img[i][k] = imgs[i][k];
+                VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = imgs[i][k],
+                                            .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = g_sc_fmt,
+                                            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+                if (vkCreateImageView(c->device, &vi, NULL, &dg.view[i][k]) != VK_SUCCESS) {
+                    dg.view[i][k] = VK_NULL_HANDLE, dg.failed = 1;
+                    rt_log("ngxfg: no view of the presenter's images: frame generation off");
+                    return 0;
+                }
+            }
+        dg.have = want;
+        rt_log("ngxfg: %d generated frames per rendered one into the DXGI presenter at %ux%u", want, w, h);
+    }
+    if (!dg.real.img) {
+        if (!ng_image(&dg.real, w, h, g_sc_fmt)) {
+            dg.failed = 1;
+            rt_log("ngxfg: no image %ux%u (format %d) for the rendered frame's copy: frame generation off", w, h, (int)g_sc_fmt);
+            return 0;
+        }
+        sync_barrier(cb, dg.real.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_NONE, 0,
+                     VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, rw);
+        vk_ngxfg_reset();   // a new size: no history
+    }
+    if (!want) {   // no picture, or the menu is open: the frame goes out alone, and the next generation starts afresh
+        vk_ngxfg_reset();
+        return 1;
+    }
+    vk_dlaa_hudless_wanted = 1;
+    const int masked = vk_hdr_native();
+    VkImageView pre_view = VK_NULL_HANDLE;
+    VkImage post = VK_NULL_HANDLE;
+    if (masked) {
+        const char *why = "";
+        static const char *told;
+        if (!fg_hud_inputs(c, &pre_view, &post, &why)) {
+            if (why != told && g_frame > 600) told = why, rt_log("ngxfg: no generated frames: %s", why);
+            vk_ngxfg_reset();
+            return 1;
+        }
+    }
+    sync_barrier(cb, dst, *last, VK_IMAGE_LAYOUT_GENERAL, *last_stage, *last_write, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, rw);
+    *last = VK_IMAGE_LAYOUT_GENERAL, *last_stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, *last_write = rw;
+    // the generated images: Direct3D's copies of them finished before this image's turn came round again (the frame
+    // waits for them, gfx_dxp.h); their old content goes
+    for (int k = 0; k < want; k++)
+        sync_barrier(cb, dg.img[idx][k], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0,
+                     VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, rw);
+    VkNgxImage bb = {dst, g_sc_view[idx], g_sc_fmt, w, h};
+    VkNgxImage hl = {hudless, g_hl_view, g_hl_fmt, g_hl_w, g_hl_h};
+    const int hl_ok = !masked && hudless && g_hl_w == w && g_hl_h == h && g_hl_fmt == g_sc_fmt;
+    VkNgxImage out[DXP_GEN], real = {dg.real.img, dg.real.view, g_sc_fmt, w, h};
+    for (int k = 0; k < want; k++) out[k] = (VkNgxImage){dg.img[idx][k], dg.view[idx][k], g_sc_fmt, w, h};
+    int made = vk_ngxfg_evaluate(cb, &bb, hl_ok ? &hl : NULL, out, want, &real);
+    if (made < 0) made = 0;
+    if (made && masked) {
+        fg_hud_post(cb, post);
+        for (int k = 0; k < made; k++) fg_hud_apply(cb, g_sc_view[idx], pre_view, dg.img[idx][k], dg.view[idx][k], to);
+    }
+    // to Direct3D, as the picture's own image goes (present_image)
+    for (int k = 0; k < made; k++) {
+        VkImageMemoryBarrier2 b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                   .srcAccessMask = rw, .dstStageMask = VK_PIPELINE_STAGE_2_NONE,
+                                   .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                   .srcQueueFamilyIndex = c->gfx_family, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL,
+                                   .image = dg.img[idx][k], .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        VkDependencyInfo d = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
+        vkCmdPipelineBarrier2(cb, &d);
+    }
+    *gen = made;
+    return 1;
 }
 
 // The image the present composes into, as *idx: the swapchain's next one (sem signals when it is free), or the DXGI
@@ -2139,6 +2290,9 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     if (src) vk_fg_frame(cb, g_sc, g_sc_fmt, g_sc_ext, hudless, g_hl_view, to);   // frame generation: this frame's preparation
     int fg_gen = 0;   // through the DXGI presenter: the preparation and the generated frame (fg_direct)
     const int fg_pair = g_dx ? fg_direct(c, cb, idx, dst, src != VK_NULL_HANDLE, hudless, to, &last, &last_stage, &last_write, &fg_gen) : 0;
+    int dg_gen = 0;   // through the DXGI presenter: DLSS Frame Generation's frames (dg_record)
+    const int dg_pair = g_dx && !fg_pair ? dg_record(c, cb, idx, dst, src != VK_NULL_HANDLE, hudless, to, &last, &last_stage,
+                                                     &last_write, &dg_gen) : 0;
     if (src) output_rate();
     if (src) vk_dlssg_frame(cb, g_sc_ext);                // DLSS Frame Generation: constants and tags (vk_dlssg.c)
     // through the presenter: the picture stays in ng.bb, and DLSS Frame Generation's frames and the copy for the
@@ -2146,6 +2300,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     int ng_set = 0;
     const int ng_count = ngp ? ng_record(cb, dst, &last, &last_stage, &last_write, hudless, &ng_set, src != VK_NULL_HANDLE) : -1;
     const int via_ng = ng_count >= 0;
+    if (src) __atomic_store_n(&g_ngx_shown, dg_pair ? dg_gen + 1 : ng_count > 0 ? ng_count + 1 : 1, __ATOMIC_RELAXED);
     if (g_dx) {   // the presenter's image goes to Direct3D, which copies it into its swapchain (gfx_dxp.h dxp_present)
         VkImageMemoryBarrier2 b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = last_stage,
                                    .srcAccessMask = last_write, .dstStageMask = VK_PIPELINE_STAGE_2_NONE, .oldLayout = last,
@@ -2208,7 +2363,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     } else if (r == VK_SUCCESS) {
         g_flip_on = 1;
         g_flip_idx = idx;
-        g_flip_pair = fg_pair, g_flip_gen = fg_gen;
+        g_flip_pair = fg_pair || dg_pair, g_flip_gen = fg_pair ? fg_gen : dg_gen;
         g_flip_frame = ll_frame;
         if (g_dx) g_dx_next = (idx + 1) % DXP_IMAGES;
         if (!defer) flip_locked();

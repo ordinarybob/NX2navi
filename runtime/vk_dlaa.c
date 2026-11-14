@@ -30,6 +30,7 @@
 #include "vk.h"
 #include "vk_dlaa.h"
 #include "vk_dlssg.h"
+#include "gfx_dxp.h"
 #include "vk_exec.h"
 #include "vk_fg.h"
 #include "vk_ffx.h"
@@ -97,7 +98,8 @@ static struct {
 } N = {.wanted = -1};
 
 // DLSS Frame Generation through NGX itself (vk_ngxfg_*, at the end of this file): NX2NAVI_FRAMEGEN = dlss where
-// Streamline does not run, which is every build but the Windows one.
+// Streamline does not run: every build but the Windows one, and on Windows a run whose picture goes out through the DXGI
+// presenter (gfx_dxp.h), which has no Vulkan swapchain for Streamline to take over.
 static struct {
     int max;                     // generated frames per rendered one this GPU allows (MultiFrameCountMax), 0: none
     NgxHandle *feat;
@@ -110,14 +112,23 @@ static struct {
 // Whether this run can generate frames through NGX: DLSS upscaling on at the start, as NGX comes up only then. The
 // swapchain then gets the presenter's extra images and NGX is asked about frame generation; whether frames are
 // generated is NX2NAVI_FRAMEGEN = dlss, read live (vk_ngxfg_on).
+// Windows: Streamline's path (vk_dlssg.c) unless DLSS Frame Generation is set at the start with HDR on, and the window's
+// display shows HDR10 from another adapter than NVIDIA's (dxp_hdr_elsewhere): the picture then goes out through the
+// DXGI presenter, and the frames are generated into its images (gfx_present.c dg_record). Asked before the instance
+// exists (vk_dlssg_wanted). NX2NAVI_DLSSG_NGX = 1 takes this path always, 0 never.
 int vk_ngxfg_wanted(void) {
-#ifdef _WIN32
-    return 0;   // Streamline's path there (vk_dlssg.c)
-#else
     static int w = -1;
-    if (w < 0) w = cfg_bool("NX2NAVI_DLAA") && strcmp(cfg_value("NX2NAVI_TAA"), "fsr3");
-    return w;
+    if (w >= 0) return w;
+    w = cfg_bool("NX2NAVI_DLAA") && strcmp(cfg_value("NX2NAVI_TAA"), "fsr3");
+#ifdef _WIN32
+    if (w) {
+        const char *force = cfg_get("NX2NAVI_DLSSG_NGX");
+        if (force && *force) w = atoi(force) != 0;
+        else w = !strcmp(cfg_value("NX2NAVI_FRAMEGEN"), "dlss") && strcmp(cfg_value("NX2NAVI_HDR"), "0") && dxp_hdr_elsewhere();
+        if (w) rt_log("ngxfg: DLSS Frame Generation through NGX into the DXGI presenter (HDR10 on a display another adapter drives)");
+    }
 #endif
+    return w;
 }
 
 typedef void (*SetI)(NgxParam *, const char *, int);
