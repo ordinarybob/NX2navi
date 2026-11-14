@@ -46,7 +46,29 @@ struct Dxp {
     VkImage img[DXP_IMAGES];
     VkDeviceMemory mem[DXP_IMAGES];
     uint64_t last[DXP_IMAGES];                   // the copy (its value on f_copied) that last read the image
+    // frame generation: the generated frames' shared images, and the thread that shows a frame's two pictures
+    ID3D12Resource *gshared[DXP_IMAGES];
+    VkImage gimg[DXP_IMAGES];
+    VkDeviceMemory gmem[DXP_IMAGES];
+    ID3D12CommandAllocator *galloc[DXP_IMAGES];
+    HANDLE th, wake, done_ev, fence_ev;
+    struct Job { uint32_t idx; uint64_t n, prev; int gen, sync, tearing; } q[4];   // q_lock
+    int qh, qn;                                  // q_lock: the first job (it stays queued while it runs) and their count
+    volatile LONG quit, failed;
+    volatile LONG64 presents;
+    uint64_t t_last, ival;                       // the pair thread's: when the last frame was rendered, the smoothed interval
 } D;
+
+CRITICAL_SECTION q_lock, dx_lock;   // the job queue; the command list and the swapchain's calls
+int locks_made;
+
+uint64_t now_ns() {
+    static LARGE_INTEGER f;
+    LARGE_INTEGER t;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t);
+    return (uint64_t)(t.QuadPart / f.QuadPart) * 1000000000ull + (uint64_t)(t.QuadPart % f.QuadPart) * 1000000000ull / (uint64_t)f.QuadPart;
+}
 
 template <class T> void drop(T *&p) {
     if (p) p->Release();
@@ -82,6 +104,7 @@ void release_device() {
     D.s_rendered = D.s_copied = VK_NULL_HANDLE;
     drop(D.f_rendered), drop(D.f_copied), drop(D.f_idle), drop(D.list);
     for (auto &a : D.alloc) drop(a);
+    for (auto &a : D.galloc) drop(a);
     drop(D.queue), drop(D.dev), drop(D.factory);
     if (D.ev) CloseHandle(D.ev);
     D.ev = nullptr;
@@ -91,6 +114,7 @@ void release_device() {
 int init() {
     if (D.tried) return D.ok;
     D.tried = 1;
+    if (!locks_made) InitializeCriticalSection(&q_lock), InitializeCriticalSection(&dx_lock), locks_made = 1;
     VkCtx *c = vk_ctx();
     if (!c || !c->has_win32_sharing) return 0;
     VkPhysicalDeviceIDProperties id = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
@@ -153,11 +177,15 @@ void free_images() {
         if (c && D.mem[i]) vkFreeMemory(c->device, D.mem[i], nullptr);
         D.img[i] = VK_NULL_HANDLE, D.mem[i] = VK_NULL_HANDLE, D.last[i] = 0;
         drop(D.shared[i]);
+        if (c && D.gimg[i]) vkDestroyImage(c->device, D.gimg[i], nullptr);
+        if (c && D.gmem[i]) vkFreeMemory(c->device, D.gmem[i], nullptr);
+        D.gimg[i] = VK_NULL_HANDLE, D.gmem[i] = VK_NULL_HANDLE;
+        drop(D.gshared[i]);
     }
 }
 
 // One image of both APIs: a shared Direct3D 12 texture, and a Vulkan image on its memory.
-int make_image(VkCtx *c, int i, VkFormat vf) {
+int make_image(VkCtx *c, VkFormat vf, ID3D12Resource **shared, VkImage *img, VkDeviceMemory *mem) {
     D3D12_HEAP_PROPERTIES hp = {};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {};
@@ -165,33 +193,35 @@ int make_image(VkCtx *c, int i, VkFormat vf) {
     rd.Width = D.w, rd.Height = D.h, rd.DepthOrArraySize = 1, rd.MipLevels = 1, rd.Format = D.fmt, rd.SampleDesc.Count = 1;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
     HRESULT hr = D.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                IID_PPV_ARGS(&D.shared[i]));
+                                                IID_PPV_ARGS(shared));
     HANDLE h = nullptr;
-    if (SUCCEEDED(hr)) hr = D.dev->CreateSharedHandle(D.shared[i], nullptr, GENERIC_ALL, nullptr, &h);
+    if (SUCCEEDED(hr)) hr = D.dev->CreateSharedHandle(*shared, nullptr, GENERIC_ALL, nullptr, &h);
     if (FAILED(hr)) return rt_log("dxp: no shared texture %ux%u (%08lx)", D.w, D.h, (unsigned long)hr), 0;
     const VkExternalMemoryHandleTypeFlagBits type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
     VkExternalMemoryImageCreateInfo ei = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO, nullptr, (VkExternalMemoryHandleTypeFlags)type};
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &ei};
     ci.imageType = VK_IMAGE_TYPE_2D, ci.format = vf, ci.extent = {D.w, D.h, 1}, ci.mipLevels = 1, ci.arrayLayers = 1;
     ci.samples = VK_SAMPLE_COUNT_1_BIT, ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-    // what the present does with a swapchain image: blits and clears into it, the menu draws into it, shots read it
-    ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    // what the present does with a swapchain image: blits and clears into it, the menu draws into it, shots read it,
+    // frame generation samples it
+    ci.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+               VK_IMAGE_USAGE_SAMPLED_BIT;
     ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE, ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkResult r = vkCreateImage(c->device, &ci, nullptr, &D.img[i]);
+    VkResult r = vkCreateImage(c->device, &ci, nullptr, img);
     if (r == VK_SUCCESS) {
         VkMemoryRequirements mr;
-        vkGetImageMemoryRequirements(c->device, D.img[i], &mr);
+        vkGetImageMemoryRequirements(c->device, *img, &mr);
         uint32_t types = mr.memoryTypeBits;
         auto props = (PFN_vkGetMemoryWin32HandlePropertiesKHR)vk_dpa(c->device, "vkGetMemoryWin32HandlePropertiesKHR");
         VkMemoryWin32HandlePropertiesKHR hp2 = {VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR};
         if (props && props(c->device, type, h, &hp2) == VK_SUCCESS && (types & hp2.memoryTypeBits)) types &= hp2.memoryTypeBits;
         uint32_t ti = 0;
         while (ti < 31 && !(types >> ti & 1)) ti++;
-        VkMemoryDedicatedAllocateInfo di = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, nullptr, D.img[i], VK_NULL_HANDLE};
+        VkMemoryDedicatedAllocateInfo di = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, nullptr, *img, VK_NULL_HANDLE};
         VkImportMemoryWin32HandleInfoKHR ii = {VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR, &di, type, h, nullptr};
         VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &ii, mr.size, ti};
-        r = vkAllocateMemory(c->device, &ai, nullptr, &D.mem[i]);
-        if (r == VK_SUCCESS) r = vkBindImageMemory(c->device, D.img[i], D.mem[i], 0);
+        r = vkAllocateMemory(c->device, &ai, nullptr, mem);
+        if (r == VK_SUCCESS) r = vkBindImageMemory(c->device, *img, *mem, 0);
     }
     CloseHandle(h);   // the import keeps its own reference
     if (r != VK_SUCCESS) return rt_log("dxp: Vulkan did not take the shared texture (%d)", (int)r), 0;
@@ -224,7 +254,160 @@ void transition(ID3D12Resource *r, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_ST
     D.list->ResourceBarrier(1, &b);
 }
 
+// Copies a shared image into the swapchain's back buffer behind rendered = n and presents it (dx_lock held). signal:
+// the copy is frame n's last reader of its images.
+int copy_present(ID3D12Resource *src, ID3D12CommandAllocator *a, uint64_t n, int signal, int sync, int tearing) {
+    ID3D12Resource *bb = nullptr;
+    if (!D.sc || FAILED(D.sc->GetBuffer(D.sc->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&bb)))) return 0;
+    a->Reset();
+    D.list->Reset(a, nullptr);
+    transition(src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    transition(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
+    D.list->CopyResource(bb, src);
+    transition(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
+    transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    D.list->Close();
+    bb->Release();   // the swapchain holds it
+    D.queue->Wait(D.f_rendered, n);   // on the GPU's side: the copy runs once Vulkan has finished the frame
+    ID3D12CommandList *lists[] = {D.list};
+    D.queue->ExecuteCommandLists(1, lists);
+    if (signal) D.queue->Signal(D.f_copied, n);
+    HRESULT hr = D.sc->Present(sync ? 1 : 0, !sync && tearing && D.tearing_ok ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    if (FAILED(hr)) {
+        static int told;
+        if (!told++) rt_log("dxp: Present failed (%08lx)", (unsigned long)hr);
+        return 0;
+    }
+    InterlockedIncrement64(&D.presents);
+    return 1;
+}
+
+void wait_fence(ID3D12Fence *f, uint64_t v, DWORD ms) {   // the pair thread's
+    if (f->GetCompletedValue() < v && SUCCEEDED(f->SetEventOnCompletion(v, D.fence_ev))) WaitForSingleObject(D.fence_ev, ms);
+}
+
+// One frame with frame generation: the generated picture when the frame is rendered, the rendered one half an
+// interval later (at once when another frame already waits, or with a present that waits for the refresh itself).
+void pair_run(const Dxp::Job &j) {
+    wait_fence(D.f_copied, j.prev, 2000);     // the allocators of these images are reset: their last copies are done
+    wait_fence(D.f_rendered, j.n, 2000);
+    uint64_t t = now_ns();
+    if (D.t_last && t - D.t_last < 100000000ull) D.ival = D.ival ? (D.ival * 3 + (t - D.t_last)) / 4 : t - D.t_last;
+    D.t_last = t;
+    int ok = 1;
+    uint64_t t_gen = t;
+    if (j.gen) {
+        EnterCriticalSection(&dx_lock);
+        ok = copy_present(D.gshared[j.idx], D.galloc[j.idx], j.n, 0, j.sync, j.tearing);
+        LeaveCriticalSection(&dx_lock);
+        t_gen = now_ns();
+        const uint64_t due = t_gen + (D.ival ? D.ival : 14000000ull) / 2;
+        while (!j.sync && !D.quit) {
+            uint64_t now = now_ns();
+            if (now >= due || D.qn > 1) break;
+            if (due - now > 2000000ull) Sleep(1);
+            else YieldProcessor();
+        }
+    }
+    EnterCriticalSection(&dx_lock);
+    ok &= copy_present(D.shared[j.idx], D.alloc[j.idx], j.n, 1, j.sync, j.tearing);
+    if (!ok) {
+        D.queue->Signal(D.f_copied, j.n);   // Vulkan's next write of these images waits for it
+        InterlockedExchange(&D.failed, 1);
+    }
+    LeaveCriticalSection(&dx_lock);
+    // how evenly the pictures reach the swapchain: from the generated one to the rendered one, and on to the next generated one
+    static uint64_t t_prev, n, sum_a, sum_b, max_a, max_b;
+    const uint64_t t_real = now_ns();
+    if (j.gen && t_prev && t_gen - t_prev < 100000000ull) {
+        const uint64_t a = t_real - t_gen, b = t_gen - t_prev;
+        n++, sum_a += a, sum_b += b;
+        if (a > max_a) max_a = a;
+        if (b > max_b) max_b = b;
+        if (n == 1200) {
+            rt_log("dxp: generated frames: generated to rendered %.2f ms (longest %.2f), rendered to the next generated %.2f ms "
+                   "(longest %.2f), over %u frames", (double)sum_a / 1e6 / (double)n, (double)max_a / 1e6,
+                   (double)sum_b / 1e6 / (double)n, (double)max_b / 1e6, (unsigned)n);
+            n = sum_a = sum_b = max_a = max_b = 0;
+        }
+    }
+    t_prev = j.gen ? t_real : 0;
+}
+
+DWORD WINAPI pair_main(void *) {
+    for (;;) {
+        WaitForSingleObject(D.wake, INFINITE);
+        for (;;) {
+            EnterCriticalSection(&q_lock);
+            int have = D.qn > 0;
+            Dxp::Job j = D.q[D.qh];
+            LeaveCriticalSection(&q_lock);
+            if (!have) break;
+            pair_run(j);
+            EnterCriticalSection(&q_lock);
+            D.qh = (D.qh + 1) % 4, D.qn--;
+            LeaveCriticalSection(&q_lock);
+            SetEvent(D.done_ev);
+        }
+        if (D.quit) return 0;
+    }
+}
+
+void pair_flush() {   // everything handed to the pair thread is shown
+    while (D.th && D.qn > 0) WaitForSingleObject(D.done_ev, 50);
+}
+
+void pair_stop() {
+    if (!D.th) return;
+    pair_flush();
+    InterlockedExchange(&D.quit, 1);
+    SetEvent(D.wake);
+    WaitForSingleObject(D.th, 5000);
+    CloseHandle(D.th), CloseHandle(D.wake), CloseHandle(D.done_ev), CloseHandle(D.fence_ev);
+    D.th = D.wake = D.done_ev = D.fence_ev = nullptr;
+    D.quit = 0, D.qh = D.qn = 0;
+}
+
 }   // namespace
+
+extern "C" int dxp_gen_images(VkImage imgs[DXP_IMAGES]) {
+    VkCtx *c = vk_ctx();
+    if (!c || !D.sc || !D.img[0]) return 0;
+    for (int i = 0; i < DXP_IMAGES; i++) {
+        if (!D.galloc[i] && FAILED(D.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&D.galloc[i])))) return 0;
+        if (!D.gimg[i] && !make_image(c, D.hdr ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : VK_FORMAT_B8G8R8A8_UNORM, &D.gshared[i],
+                                      &D.gimg[i], &D.gmem[i])) {
+            rt_log("dxp: no images for generated frames");
+            return 0;
+        }
+        imgs[i] = D.gimg[i];
+    }
+    return 1;
+}
+
+extern "C" int dxp_present_pair(uint32_t idx, uint64_t n, int gen, int sync, int tearing) {
+    if (!D.sc || idx >= DXP_IMAGES || !D.shared[idx] || (gen && !D.gshared[idx])) return 0;
+    if (InterlockedExchange(&D.failed, 0)) return 0;
+    if (!D.th) {
+        D.wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        D.done_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        D.fence_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        D.t_last = D.ival = 0;
+        D.th = D.wake && D.done_ev && D.fence_ev ? CreateThread(nullptr, 0, pair_main, nullptr, 0, nullptr) : nullptr;
+        if (!D.th) return rt_log("dxp: no thread for frame generation's presents"), 0;
+        SetThreadDescription(D.th, L"dxgi present");
+    }
+    while (D.qn >= 4) WaitForSingleObject(D.done_ev, 50);   // the thread is behind: wait for a place
+    EnterCriticalSection(&q_lock);
+    D.q[(D.qh + D.qn) % 4] = {idx, n, D.last[idx], gen, sync, tearing};
+    D.qn++;
+    LeaveCriticalSection(&q_lock);
+    D.last[idx] = n;
+    SetEvent(D.wake);
+    return 1;
+}
+
+extern "C" uint64_t dxp_presents(void) { return (uint64_t)D.presents; }
 
 extern "C" int dxp_hdr_display(void) {
     if (!init()) return 0;
@@ -254,6 +437,8 @@ extern "C" int dxp_hdr_display(void) {
 extern "C" int dxp_create(uint32_t w, uint32_t h, int *hdr, VkFormat *fmt, VkImage imgs[DXP_IMAGES]) {
     VkCtx *c = vk_ctx();
     if (!init() || !c || !w || !h) return 0;
+    pair_flush();
+    InterlockedExchange(&D.failed, 0);
     queue_idle();
     free_images();
     D.w = w, D.h = h;
@@ -272,7 +457,7 @@ extern "C" int dxp_create(uint32_t w, uint32_t h, int *hdr, VkFormat *fmt, VkIma
     }
     *fmt = D.hdr ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : VK_FORMAT_B8G8R8A8_UNORM;
     for (int i = 0; i < DXP_IMAGES; i++) {
-        if (!make_image(c, i, *fmt)) return free_images(), 0;
+        if (!make_image(c, *fmt, &D.shared[i], &D.img[i], &D.mem[i])) return free_images(), 0;
         imgs[i] = D.img[i];
     }
     static uint32_t lw, lh;
@@ -285,6 +470,7 @@ extern "C" int dxp_create(uint32_t w, uint32_t h, int *hdr, VkFormat *fmt, VkIma
 }
 
 extern "C" void dxp_destroy(void) {
+    pair_stop();
     queue_idle();
     free_images();
     drop(D.sc);
@@ -300,32 +486,20 @@ extern "C" VkSemaphore dxp_copied(uint32_t idx, uint64_t *value) {
 
 extern "C" int dxp_present(uint32_t idx, uint64_t n, int sync, int tearing) {
     if (!D.sc || idx >= DXP_IMAGES || !D.shared[idx]) return 0;
+    pair_flush();   // frame generation was just switched off: its last frames first
     // the allocator of this image's last copy is reset: that copy has to be done (it nearly always is, three presents on)
     if (D.f_copied->GetCompletedValue() < D.last[idx] && SUCCEEDED(D.f_copied->SetEventOnCompletion(D.last[idx], D.ev)))
         WaitForSingleObject(D.ev, 2000);
+    EnterCriticalSection(&dx_lock);
     ID3D12Resource *bb = nullptr;
-    if (FAILED(D.sc->GetBuffer(D.sc->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&bb)))) return 0;
-    D.alloc[idx]->Reset();
-    D.list->Reset(D.alloc[idx], nullptr);
-    transition(D.shared[idx], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    transition(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
-    D.list->CopyResource(bb, D.shared[idx]);
-    transition(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT);
-    transition(D.shared[idx], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-    D.list->Close();
-    bb->Release();   // the swapchain holds it
-    D.queue->Wait(D.f_rendered, n);   // on the GPU's side: the copy runs once Vulkan has finished the frame
-    ID3D12CommandList *lists[] = {D.list};
-    D.queue->ExecuteCommandLists(1, lists);
-    D.queue->Signal(D.f_copied, n);
-    D.last[idx] = n;
-    HRESULT hr = D.sc->Present(sync ? 1 : 0, !sync && tearing && D.tearing_ok ? DXGI_PRESENT_ALLOW_TEARING : 0);
-    if (FAILED(hr)) {
-        static int told;
-        if (!told++) rt_log("dxp: Present failed (%08lx)", (unsigned long)hr);
-        return 0;
+    int ok = SUCCEEDED(D.sc->GetBuffer(D.sc->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&bb)));   // as copy_present starts
+    if (bb) bb->Release();
+    if (ok) {
+        D.last[idx] = n;   // the copy is queued and signals whether or not the present then fails
+        ok = copy_present(D.shared[idx], D.alloc[idx], n, 1, sync, tearing);
     }
-    return 1;
+    LeaveCriticalSection(&dx_lock);
+    return ok;
 }
 
 extern "C" void dxp_metadata(float peak_nits, float frame_nits) {
@@ -335,5 +509,7 @@ extern "C" void dxp_metadata(float peak_nits, float frame_nits) {
     m.BluePrimary[0] = 6550, m.BluePrimary[1] = 2300, m.WhitePoint[0] = 15635, m.WhitePoint[1] = 16450;
     m.MaxMasteringLuminance = (UINT)peak_nits, m.MinMasteringLuminance = 0;
     m.MaxContentLightLevel = (UINT16)(peak_nits > 65535 ? 65535 : peak_nits), m.MaxFrameAverageLightLevel = (UINT16)frame_nits;
+    EnterCriticalSection(&dx_lock);
     D.sc->SetHDRMetaData(DXGI_HDR_METADATA_TYPE_HDR10, sizeof m, &m);
+    LeaveCriticalSection(&dx_lock);
 }

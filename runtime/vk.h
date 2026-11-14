@@ -248,6 +248,8 @@ void vk_hdr_off(void);   // probes that read back 8-bit swapchain pixels: SDR wh
 int vk_hdr_surface_format(const VkSurfaceFormatKHR *f, uint32_t n, VkSurfaceFormatKHR *out);
 void vk_hdr_metadata(VkSwapchainKHR sc, int new_sc);
 void vk_hdr_metadata_dxgi(int new_sc);   // the same for the DXGI presenter's swapchain (gfx_dxp.h)
+float vk_hdr_peak_nits(void);            // the display's peak as the HDR settings give it
+int vk_hdr_fg_source(VkImage *image, VkFormat *format, uint32_t *w, uint32_t *h);
 void vk_hdr_set_active(int on);
 int vk_hdr_active(void);
 VkImage vk_hdr_encode(VkCommandBuffer cb, unsigned slot, VkImage src, VkFormat fmt, const int crop[4]);
@@ -633,6 +635,7 @@ typedef struct {
                                    // the GPU is past the submission being recorded (vk_defer_free), as the replay and DLSS
                                    // keep pointers to render targets across a command buffer; no view of it is cached
 } VkTexImage;
+void vk_hdr_fg_track(const VkTexImage *win);   // frame generation with the game's own HDR picture (vk_hdr.c)
 // A 2D texture a shader samples as a 3D one: its one-slice 3D copy, refreshed when its content changed (vk_texture.c);
 // NULL when it does not qualify. Texture lock held.
 const VkTexImage *vk_texture_flat3d_locked(const VkTexImage *img, uint32_t layer);

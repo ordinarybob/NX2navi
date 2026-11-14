@@ -31,6 +31,7 @@
 #include "vk.h"
 #include "vk_fg.h"
 #include "vk_dlaa.h"
+#include "fg_hudmask_spv.h"
 #include "vk_dlssg.h"
 #include "vk_lowlat.h"
 
@@ -201,6 +202,19 @@ static int g_dx;             // presents go through it (dx_swapchain)
 static int g_dx_failed;      // it could not be made: not tried again in this run
 static uint32_t g_dx_next;   // the image the next present composes into: they go round in turn
 static uint64_t g_dx_n;      // the last frame's number on its timelines
+// Frame generation through it (fg_direct): the presenter's images for the generated frames, the image FSR writes one
+// into, and how the submitted frame goes out (flip_locked): through the presenter's pair thread, with a generated frame
+static VkImage g_dxg_img[DXP_IMAGES];
+static int g_dxg;
+static VkImage g_fgo;
+static VmaAllocation g_fgo_mem;
+static VkImageView g_fgo_view;
+static VkImage g_fgx;              // the game's own HDR: the picture its last pass read, as RGBA16F (fg_hud_keep)
+static VmaAllocation g_fgx_mem;
+static VkImageView g_fgx_view;
+static uint32_t g_fgx_w, g_fgx_h;
+static int g_flip_pair, g_flip_gen;
+static void fg_direct_free(VkCtx *c);
 static int g_hdr_was = -1;   // the kind of the last swapchain: the log says when a later one is of the other kind
 
 // ---- NX2NAVI_FLIGHT thumbnails (flight.c; g_pl): each present also blits the swapchain image down into slot frame % g_th_n
@@ -311,7 +325,9 @@ static void window_settings_live(void) {
     if (started && v == seen) return;
     seen = v;
     res_fov_live();
-    if (started && vk_fg_wanted() != vk_fg_active()) plat_xchg32(&g_dirty, 1);   // frame generation switched: its own swapchain
+    // frame generation switched: its own swapchain, or none through the DXGI presenter, whose extra images then go
+    if (started && vk_fg_wanted() != (vk_fg_active() || (g_dx && vk_fg_direct_ok()))) plat_xchg32(&g_dirty, 1);
+    if (started && g_dx && g_dxg && !vk_fg_direct_ok()) plat_xchg32(&g_dirty, 1);
     const char *e = cfg_value("NX2NAVI_VK_PRESENT");
     if (!started || strncmp(e, present, sizeof present - 1)) {
         snprintf(present, sizeof present, "%s", e);
@@ -375,7 +391,9 @@ static void flip_locked(void) {
         VkLowlatPresent ll;   // a driver's low latency: AMD's present stage, the frame's statistics (no Vulkan swapchain
         vk_lowlat_present_begin(g_flip_frame, &ll);   // for NVIDIA's markers)
         g_flip_frame = 0;
-        if (!dxp_present(g_flip_idx, g_dx_n, !mailbox && !immediate, immediate)) plat_xchg32(&g_dirty, 1);
+        int ok = g_flip_pair ? dxp_present_pair(g_flip_idx, g_dx_n, g_flip_gen, !mailbox && !immediate, immediate)
+                             : dxp_present(g_flip_idx, g_dx_n, !mailbox && !immediate, immediate);
+        if (!ok) plat_xchg32(&g_dirty, 1);
         vk_lowlat_present_end(&ll);
         return;
     }
@@ -438,6 +456,8 @@ static int dx_swapchain(VkCtx *c, VkExtent2D ext) {
     }
     vk_lowlat_swapchain(VK_NULL_HANDLE, 0);   // the driver's low latency names a Vulkan swapchain: none from here on
     drop_swapchain_locked(c);   // the Vulkan swapchain, or the views of the presenter's earlier images
+    fg_direct_free(c);          // frame generation's images have the old size, or it was switched off
+    if (!vk_fg_direct_ok() && !vk_fg_active()) vk_fg_release();
     int hdr = 1;
     VkFormat fmt = VK_FORMAT_UNDEFINED;
     VkImage img[DXP_IMAGES];
@@ -499,7 +519,9 @@ static int create_swapchain(void) {
     // HDR without an HDR10 surface format: through the DXGI presenter when the window's display shows HDR10 (not with
     // frame generation, whose swapchains are Vulkan ones). Otherwise the picture stays SDR.
     if (g_sc_hdr_wanted && !hdr) {
-        if (!g_dx_failed && !vk_fg_wanted() && !vk_dlssg_active() && dxp_hdr_display() && dx_swapchain(c, ext)) return 1;
+        if (!g_dx_failed && (!vk_fg_wanted() || vk_fg_direct_ok()) && !vk_dlssg_active() && dxp_hdr_display() &&
+            dx_swapchain(c, ext))
+            return 1;
         static int told;
         if (!told++)
             rt_log("hdr: the picture stays SDR (Windows: turn on \"Use HDR\" in the display settings; Linux: a Wayland "
@@ -522,6 +544,7 @@ static int create_swapchain(void) {
     vk_lowlat_swapchain(VK_NULL_HANDLE, 0);   // NVIDIA's low-latency calls name the swapchain: none while it is replaced
     if (g_dx) {   // HDR was switched off, or frame generation on: the presenter leaves the window to a Vulkan swapchain
         drop_swapchain_locked(c);   // the views of its images
+        fg_direct_free(c);
         dxp_destroy();
         g_dx = 0;
     }
@@ -1120,7 +1143,8 @@ static int ng_running(void);          // that presenter is in use
 static void output_rate(void) {
     static uint64_t t0, n0;
     uint64_t ng_n = ng_presented();
-    uint64_t n = ng_n ? ng_n : vk_dlssg_active() ? vk_dlssg_shown() : vk_fg_presents(g_sc), t = plat_now_ns();
+    uint64_t n = ng_n ? ng_n : g_flip_pair ? dxp_presents() : vk_dlssg_active() ? vk_dlssg_shown() : vk_fg_presents(g_sc);
+    uint64_t t = plat_now_ns();
     if (!n) { g_out_fps = 0, t0 = 0; return; }
     if (!t0 || n < n0) { t0 = t, n0 = n; return; }
     if (t - t0 >= 500000000ull) g_out_fps = (double)(n - n0) * 1e9 / (double)(t - t0), t0 = t, n0 = n;
@@ -1138,7 +1162,8 @@ static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, c
     VkImageView pv;
     uint32_t pw, ph;
     VkFormat pf;
-    if (!(vk_fg_active() || ng_running()) || !vk_dlaa_fg_hudless(&pic, &pv, &pw, &ph, &pf) || !pw || !ph || w <= 0 || h <= 0)
+    if (!(vk_fg_active() || ng_running() || (g_dx && vk_fg_direct_ok())) || !vk_dlaa_fg_hudless(&pic, &pv, &pw, &ph, &pf) ||
+        !pw || !ph || w <= 0 || h <= 0)
         return VK_NULL_HANDLE;
     // The upscaler's output can be smaller than the presented picture: the scene is 75% of it in handheld mode
     // (widescreen.c, 1440x810 in a 1920x1080 picture) and the game's last passes scale it up with the HUD. Taken only
@@ -1193,6 +1218,204 @@ static VkImage hudless_record(VkCommandBuffer cb, unsigned slot, int w, int h, c
     return g_hl;
 }
 
+
+// ---------------------------------------------------------------- AMD's frame generation through the DXGI presenter
+// With HDR10 through the DXGI presenter there is no Vulkan swapchain for AMD's frame generation swapchain to replace,
+// so the present generates the frame itself (vk_fg.cpp vk_fg_direct_frame): after the picture is complete in the
+// presenter's image dst, FSR writes the frame between it and the one before into g_fgo, which is copied into the
+// presenter's image for generated frames of the same index. The presenter then shows that one first and dst half a
+// frame interval later (gfx_dxp.h dxp_present_pair). 1: the frame goes out through the pair thread; *gen: with a
+// generated frame. 0: frame generation is off, the frame goes out as before.
+static void fg_direct_free(VkCtx *c) {   // the device idle
+    if (g_fgo_view) vkDestroyImageView(c->device, g_fgo_view, NULL);
+    if (g_fgo) vmaDestroyImage(c->vma, g_fgo, g_fgo_mem);
+    if (g_fgx_view) vkDestroyImageView(c->device, g_fgx_view, NULL);
+    if (g_fgx) vmaDestroyImage(c->vma, g_fgx, g_fgx_mem);
+    g_fgo = g_fgx = VK_NULL_HANDLE, g_fgo_view = g_fgx_view = VK_NULL_HANDLE;
+    g_dxg = 0;   // the presenter frees its images with its next swapchain
+}
+
+// The HUD of the rendered frame into the generated one, for the game's own HDR picture (shaders/fg_hudmask.comp).
+static struct {
+    int tried, ok;
+    VkDescriptorSetLayout dsl;
+    VkPipelineLayout layout;
+    VkPipeline pipe;
+    VkSampler sampler;
+    PFN_vkCmdPushDescriptorSetKHR push;
+} HM;
+
+static int hm_init(VkCtx *c) {
+    if (HM.tried) return HM.ok;
+    HM.tried = 1;
+    HM.push = (PFN_vkCmdPushDescriptorSetKHR)vk_dpa(c->device, "vkCmdPushDescriptorSetKHR");
+    VkDescriptorSetLayoutBinding b[4];
+    for (int i = 0; i < 4; i++)
+        b[i] = (VkDescriptorSetLayoutBinding){.binding = (uint32_t)i, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                                              .descriptorType = i < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                                      : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+    VkDescriptorSetLayoutCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                           .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+                                           .bindingCount = 4, .pBindings = b};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};
+    VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                     .pSetLayouts = &HM.dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+    VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST,
+                              .minFilter = VK_FILTER_NEAREST, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                              .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                              .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = 0};
+    VkShaderModuleCreateInfo mi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+                                   .codeSize = sizeof fg_hudmask_spv, .pCode = fg_hudmask_spv};
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (!HM.push || vkCreateDescriptorSetLayout(c->device, &dci, NULL, &HM.dsl) != VK_SUCCESS ||
+        vkCreatePipelineLayout(c->device, &li, NULL, &HM.layout) != VK_SUCCESS ||
+        vkCreateSampler(c->device, &si, NULL, &HM.sampler) != VK_SUCCESS ||
+        vkCreateShaderModule(c->device, &mi, NULL, &m) != VK_SUCCESS)
+        return rt_log("gfx: the HUD pass for generated frames could not be created"), 0;
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
+                                      .layout = HM.layout};
+    VkResult r = vkCreateComputePipelines(c->device, VK_NULL_HANDLE, 1, &ci, NULL, &HM.pipe);
+    vkDestroyShaderModule(c->device, m, NULL);
+    if (r != VK_SUCCESS) return rt_log("gfx: the HUD pass for generated frames could not be created"), 0;
+    return HM.ok = 1;
+}
+
+static void hm_release(VkCtx *c) {
+    if (HM.pipe) vkDestroyPipeline(c->device, HM.pipe, NULL);
+    if (HM.layout) vkDestroyPipelineLayout(c->device, HM.layout, NULL);
+    if (HM.dsl) vkDestroyDescriptorSetLayout(c->device, HM.dsl, NULL);
+    if (HM.sampler) vkDestroySampler(c->device, HM.sampler, NULL);
+    memset(&HM, 0, sizeof HM);
+}
+
+// What the mask needs this frame: the picture before the HUD (vk_dlaa.c) and the one the game's last pass read
+// (vk_hdr.c), the same size. 1 with both; the second is copied into g_fgx by fg_hud_keep.
+static int fg_hud_inputs(VkCtx *c, VkImageView *pre_view, VkImage *post, const char **why) {
+    VkImage pre;
+    VkFormat pf;
+    uint32_t w, h, pw, ph;
+    if (!hm_init(c)) return *why = "its pass could not be made", 0;
+    if (g_sc_fmt != VK_FORMAT_A2B10G10R10_UNORM_PACK32) return *why = "the picture is not HDR10", 0;
+    if (!vk_dlaa_fg_prehud(&pre, pre_view, &w, &h)) return *why = "no picture from before the HUD", 0;
+    if (!vk_hdr_fg_source(post, &pf, &pw, &ph)) return *why = "the game's last pass reads no single float picture", 0;
+    if (pw != w || ph != h) return *why = "the game's last pass reads a picture of another size", 0;
+    if (g_fgx && (g_fgx_w != w || g_fgx_h != h)) return *why = "the picture changed its size", 0;   // made again with the swapchain
+    if (!g_fgx) {
+        VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+                                .format = VK_FORMAT_R16G16B16A16_SFLOAT, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
+                                .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateImage(c->vma, &ii, &ai, &g_fgx, &g_fgx_mem, NULL) != VK_SUCCESS) return g_fgx = VK_NULL_HANDLE, *why = "no memory", 0;
+        VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_fgx, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                    .format = VK_FORMAT_R16G16B16A16_SFLOAT, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        if (vkCreateImageView(c->device, &vi, NULL, &g_fgx_view) != VK_SUCCESS) return *why = "no view", 0;
+        g_fgx_w = w, g_fgx_h = h;
+    }
+    return 1;
+}
+
+// dst (the rendered frame) and g_fgo (the generated one) are in GENERAL.
+static void fg_hud_keep(VkCommandBuffer cb, VkImageView dst_view, VkImageView pre_view, VkImage post, const int to[4]) {
+    const VkAccessFlags2 rw = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    sync_barrier(cb, g_fgx, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, rw,
+                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkImageBlit b = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)g_fgx_w, (int32_t)g_fgx_h, 1}},
+                     .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {(int32_t)g_fgx_w, (int32_t)g_fgx_h, 1}}};
+    vkCmdBlitImage(cb, post, VK_IMAGE_LAYOUT_GENERAL, g_fgx, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
+    sync_barrier(cb, g_fgx, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                 VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+    VkDescriptorImageInfo im[4] = {{HM.sampler, pre_view, VK_IMAGE_LAYOUT_GENERAL}, {HM.sampler, g_fgx_view, VK_IMAGE_LAYOUT_GENERAL},
+                                   {HM.sampler, dst_view, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, g_fgo_view, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet wr[4];
+    for (int i = 0; i < 4; i++)
+        wr[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = (uint32_t)i, .descriptorCount = 1,
+                                       .descriptorType = i < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+                                                               : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .pImageInfo = &im[i]};
+    static int debug = -1;   // NX2NAVI_FG_MASK_SHOW=1: the mask in white in the generated frame, to check it
+    if (debug < 0) debug = cfg_get("NX2NAVI_FG_MASK_SHOW") != NULL;
+    float pc[8] = {(float)to[0], (float)to[1], (float)to[2], (float)to[3], (float)debug, 0, 0, 0};
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, HM.pipe);
+    HM.push(cb, VK_PIPELINE_BIND_POINT_COMPUTE, HM.layout, 0, 4, wr);
+    vkCmdPushConstants(cb, HM.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    vkCmdDispatch(cb, (g_sc_ext.width + 7) / 8, (g_sc_ext.height + 7) / 8, 1);
+    sync_barrier(cb, g_fgo, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                 VK_ACCESS_2_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, rw);
+}
+
+static int fg_direct(VkCtx *c, VkCommandBuffer cb, uint32_t idx, VkImage dst, int scene, VkImage hudless, const int to[4],
+                     VkImageLayout *last, VkPipelineStageFlags2 *last_stage, VkAccessFlags2 *last_write, int *gen) {
+    *gen = 0;
+    if (!vk_fg_direct_ok()) return 0;
+    const VkAccessFlags2 rw = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+    if (!g_dxg) {
+        static int failed;
+        if (failed || !dxp_gen_images(g_dxg_img)) return failed = 1, 0;
+        g_dxg = 1;
+    }
+    if (!g_fgo) {
+        static int told;
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(c->phys, g_sc_fmt, &fp);
+        VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = g_sc_fmt,
+                                .extent = {g_sc_ext.width, g_sc_ext.height, 1}, .mipLevels = 1, .arrayLayers = 1,
+                                .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) ||
+            vmaCreateImage(c->vma, &ii, &ai, &g_fgo, &g_fgo_mem, NULL) != VK_SUCCESS) {
+            if (!told++) rt_log("gfx: no image of format %d for generated frames: frames go out without them", (int)g_sc_fmt);
+            g_fgo = VK_NULL_HANDLE;
+            return 1;
+        }
+        VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_fgo, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                                    .format = g_sc_fmt, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        if (vkCreateImageView(c->device, &vi, NULL, &g_fgo_view) != VK_SUCCESS) g_fgo_view = VK_NULL_HANDLE;
+        rt_log("gfx: frame generation through the DXGI presenter at %ux%u", g_sc_ext.width, g_sc_ext.height);
+    }
+    if (!scene) return 1;
+    // The game's own HDR picture has no HUD-less one: the generated frame gets the rendered frame's HUD afterwards
+    // (fg_hud_keep), and without what that needs the frame goes out alone.
+    const int masked = vk_hdr_native();
+    VkImageView pre_view = VK_NULL_HANDLE;
+    VkImage post = VK_NULL_HANDLE;
+    if (masked) {
+        vk_dlaa_hudless_wanted = 1;
+        const char *why = "";
+        static const char *told;
+        if (!g_fgo_view || !fg_hud_inputs(c, &pre_view, &post, &why)) {
+            if (g_fgo_view && why != told && g_frame > 600) told = why, rt_log("gfx: no generated frames: %s", why);
+            return 1;
+        }
+    }
+    sync_barrier(cb, dst, *last, VK_IMAGE_LAYOUT_GENERAL, *last_stage, *last_write, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, rw);
+    *last = VK_IMAGE_LAYOUT_GENERAL, *last_stage = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, *last_write = rw;
+    sync_barrier(cb, g_fgo, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, rw,
+                 VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, rw);
+    if (!vk_fg_direct_frame(cb, g_sc_fmt, g_sc_ext, masked ? VK_NULL_HANDLE : hudless, to, dst, g_fgo, vk_hdr_peak_nits(), masked))
+        return 1;
+    if (masked) fg_hud_keep(cb, g_sc_view[idx], pre_view, post, to);
+    VkImage gi = g_dxg_img[idx];
+    sync_barrier(cb, g_fgo, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                 rw, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    sync_barrier(cb, gi, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0,
+                 VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkImageCopy cp = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                      .extent = {g_sc_ext.width, g_sc_ext.height, 1}};
+    vkCmdCopyImage(cb, g_fgo, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, gi, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &cp);
+    // to Direct3D, as the picture's own image goes (present_image)
+    VkImageMemoryBarrier2 b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                               .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_NONE,
+                               .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                               .srcQueueFamilyIndex = c->gfx_family, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL, .image = gi,
+                               .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    VkDependencyInfo d = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b};
+    vkCmdPipelineBarrier2(cb, &d);
+    *gen = 1;
+    return 1;
+}
 
 // ---------------------------------------------------------------- DLSS Frame Generation through NGX (vk_ngxfg_*)
 // NX2NAVI_FRAMEGEN = dlss where Streamline does not run (every build but the Windows one; vk_ngxfg_wanted is 0 there
@@ -1792,6 +2015,8 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         record_thumb(cb, dst, slot);
     }
     if (src) vk_fg_frame(cb, g_sc, g_sc_fmt, g_sc_ext, hudless, g_hl_view, to);   // frame generation: this frame's preparation
+    int fg_gen = 0;   // through the DXGI presenter: the preparation and the generated frame (fg_direct)
+    const int fg_pair = g_dx ? fg_direct(c, cb, idx, dst, src != VK_NULL_HANDLE, hudless, to, &last, &last_stage, &last_write, &fg_gen) : 0;
     if (src) output_rate();
     if (src) vk_dlssg_frame(cb, g_sc_ext);                // DLSS Frame Generation: constants and tags (vk_dlssg.c)
     // through the presenter: the picture stays in ng.bb, and DLSS Frame Generation's frames and the copy for the
@@ -1861,6 +2086,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     } else if (r == VK_SUCCESS) {
         g_flip_on = 1;
         g_flip_idx = idx;
+        g_flip_pair = fg_pair, g_flip_gen = fg_gen;
         g_flip_frame = ll_frame;
         if (g_dx) g_dx_next = (idx + 1) % DXP_IMAGES;
         if (!defer) flip_locked();
@@ -1951,6 +2177,8 @@ void gfx_window_release_vk(void) {
             if (g_sc_view[i]) vkDestroyImageView(c->device, g_sc_view[i], NULL);
             g_sc_view[i] = VK_NULL_HANDLE;
         }
+        if (g_dx) fg_direct_free(c), vk_fg_release();   // frame generation through it
+        hm_release(c);
         dxp_destroy();   // the DXGI presenter's images and timelines (their views went above)
         g_dx = 0;
         if (g_pool) vkDestroyCommandPool(c->device, g_pool, NULL);
