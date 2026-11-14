@@ -11,12 +11,14 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_win32.h>
 
 extern "C" {
+#include "cfg.h"
 #include "gfx_dxp.h"
 #include "host.h"
 #include "vk.h"
@@ -39,6 +41,7 @@ struct Dxp {
     int tearing_ok;
     // the swapchain and what it shows
     IDXGISwapChain4 *sc;
+    HANDLE lat;                                  // the swapchain's frame latency object: signalled while a present has room
     uint32_t w, h;
     DXGI_FORMAT fmt;
     int hdr;
@@ -198,10 +201,29 @@ int make_image(VkCtx *c, int i, VkFormat vf) {
     return 1;
 }
 
+// Pictures the swapchain may hold queued for the display (NX2NAVI_DXP_LATENCY, 1 to 16, default 2). Each present
+// first waits until there is room (dxp_present), so a game giving pictures at the display's rate waits for the display a
+// little at each and never holds more than this many refreshes of delay. With DXGI's own limit of three, a present that
+// found the queue full blocked for a refresh where it stood, after its copy was queued.
+static UINT sc_latency() {
+    static UINT n;
+    if (!n) {
+        const char *e = cfg_get("NX2NAVI_DXP_LATENCY");
+        int v = e && *e ? atoi(e) : 2;
+        n = (UINT)(v < 1 ? 1 : v > 16 ? 16 : v);
+    }
+    return n;
+}
+
+void drop_swapchain() {
+    if (D.lat) CloseHandle(D.lat), D.lat = nullptr;
+    drop(D.sc);
+}
+
 // The swapchain at D.w x D.h in D.fmt: a new one, or the old one with new buffers.
 int make_swapchain() {
-    const UINT flags = D.tearing_ok ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
-    if (D.sc && FAILED(D.sc->ResizeBuffers(DXP_IMAGES, D.w, D.h, D.fmt, flags))) drop(D.sc);
+    const UINT flags = (D.tearing_ok ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0) | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    if (D.sc && FAILED(D.sc->ResizeBuffers(DXP_IMAGES, D.w, D.h, D.fmt, flags))) drop_swapchain();
     if (D.sc) return 1;
     DXGI_SWAP_CHAIN_DESC1 sd = {};
     sd.Width = D.w, sd.Height = D.h, sd.Format = D.fmt, sd.SampleDesc.Count = 1, sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -212,6 +234,7 @@ int make_swapchain() {
     if (SUCCEEDED(hr)) hr = sc1->QueryInterface(IID_PPV_ARGS(&D.sc));
     drop(sc1);
     if (FAILED(hr)) return rt_log("dxp: no DXGI swapchain %ux%u (%08lx)", D.w, D.h, (unsigned long)hr), 0;
+    if (SUCCEEDED(D.sc->SetMaximumFrameLatency(sc_latency()))) D.lat = D.sc->GetFrameLatencyWaitableObject();
     D.factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);   // the window's keys stay its own
     return 1;
 }
@@ -287,7 +310,7 @@ extern "C" int dxp_create(uint32_t w, uint32_t h, int *hdr, VkFormat *fmt, VkIma
 extern "C" void dxp_destroy(void) {
     queue_idle();
     free_images();
-    drop(D.sc);
+    drop_swapchain();
     release_device();
     D.tried = D.ok = 0;
 }
@@ -303,6 +326,7 @@ extern "C" int dxp_present(uint32_t idx, uint64_t n, int sync, int tearing) {
     // the allocator of this image's last copy is reset: that copy has to be done (it nearly always is, three presents on)
     if (D.f_copied->GetCompletedValue() < D.last[idx] && SUCCEEDED(D.f_copied->SetEventOnCompletion(D.last[idx], D.ev)))
         WaitForSingleObject(D.ev, 2000);
+    if (D.lat) WaitForSingleObjectEx(D.lat, 100, FALSE);   // room in the display's queue (sc_latency)
     ID3D12Resource *bb = nullptr;
     if (FAILED(D.sc->GetBuffer(D.sc->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&bb)))) return 0;
     D.alloc[idx]->Reset();
@@ -324,6 +348,24 @@ extern "C" int dxp_present(uint32_t idx, uint64_t n, int sync, int tearing) {
         static int told;
         if (!told++) rt_log("dxp: Present failed (%08lx)", (unsigned long)hr);
         return 0;
+    }
+    // every 5 s: how many refreshes showed a new picture (DXGI's own count; a picture shown twice, or one that never
+    // reached the screen, is a hitch)
+    static LARGE_INTEGER qf, t0;
+    static UINT pc0, sr0, given0, given;
+    given++;
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    if (!qf.QuadPart) QueryPerformanceFrequency(&qf);
+    DXGI_FRAME_STATISTICS fs;
+    if (t.QuadPart - t0.QuadPart >= 5 * qf.QuadPart && SUCCEEDED(D.sc->GetFrameStatistics(&fs))) {
+        if (t0.QuadPart && fs.SyncRefreshCount > sr0) {
+            const UINT shown = fs.PresentCount - pc0, ref = fs.SyncRefreshCount - sr0, gave = given - given0;
+            rt_log("dxp: %.1f s: %u refreshes, %u of them with a new picture; %u pictures given, %u not shown",
+                   (double)(t.QuadPart - t0.QuadPart) / (double)qf.QuadPart, ref, shown < ref ? shown : ref, gave,
+                   gave > shown ? gave - shown : 0);
+        }
+        t0 = t, pc0 = fs.PresentCount, sr0 = fs.SyncRefreshCount, given0 = given;
     }
     return 1;
 }
