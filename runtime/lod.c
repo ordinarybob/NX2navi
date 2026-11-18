@@ -44,7 +44,7 @@ typedef struct { const char *name; uint32_t off; int k; } Field;
 static const Field kParam[] = {
     {"DynamicOffsetForNormal", 0x38, K_DYNAMIC},   {"DynamicOffsetForStaticDemo", 0x3c, K_NONE},
     {"FovyScaleForNoraml", 0x40, K_NONE},          {"FovyScaleForTimeline", 0x44, K_NONE},
-    {"LodStartDistCoefForConsole", 0x48, K_START}, {"LodStartDistCoefForHandheld", 0x4c, K_START_HH},
+    {"LodStartDistCoefForConsole", 0x48, K_NONE},  {"LodStartDistCoefForHandheld", 0x4c, K_NONE},   // model_start_factor
     {"MaxLevelDistScale", 0x50, K_MAX},            {"StaticOffset", 0x54, K_STATIC},
 };
 // game__foliage__ResLodSetting, as its reader at main+0x2bed300 names and places the fields
@@ -280,9 +280,11 @@ static uint64_t ptr_at(uint64_t at) { return at >= 0x10000 && !(at & 7) && plat_
 // The model's name where the reader of its configuration (main+0x89548) has it at the two sites: through the frame's
 // slot +0x48 (the object at its +0xa8, then that one's first pointer, the name at +0xec), or through x22 (+0x18, +0x58,
 // the name at +0x14). NULL when neither leads to a string.
+// The model's name at the two sites of the configuration's reader: from the model's own record (x22), and failing
+// that from the reader's frame, which at times still holds the model read before.
 static const char *model_name(const Cpu *c) {
-    uint64_t at[2] = {ptr_at(ptr_at(ptr_at(c->x[29] + 0x48) + 0xa8)), ptr_at(ptr_at(c->x[22] + 0x18) + 0x58)};
-    static const uint32_t off[2] = {0xec, 0x14};
+    uint64_t at[2] = {ptr_at(ptr_at(c->x[22] + 0x18) + 0x58), ptr_at(ptr_at(ptr_at(c->x[29] + 0x48) + 0xa8))};
+    static const uint32_t off[2] = {0x14, 0xec};
     for (int i = 0; i < 2; i++) {
         uint64_t a = at[i] ? at[i] + off[i] : 0;
         if (!a || !plat_mem_readable(a, 64)) continue;
@@ -301,25 +303,42 @@ static int self_fading(const char *name) {
     return 0;
 }
 
+// The start distance settings as one model's factor. GameLODParam's two start coefficients stay the game's: raised
+// there they reach every model, and the trees that fade their own leaves (kSelfFading) then stand bare, among them
+// ones that never pass the reader of the model's configuration, where a model can be told by its name. So the
+// settings act here instead, on the models that pass that reader, and a self-fading one is not raised.
+static float model_start_factor(const char *name) {
+    static int handheld = -1;
+    if (handheld < 0) handheld = !strcmp(cfg_value("NX2NAVI_OPERATION_MODE"), "handheld");
+    float f = k_model_start * factor[handheld ? K_START_HH : K_START];
+    static uint32_t kept;
+    if (f > 1 && self_fading(name)) {
+        if (++kept <= 4 || kept == 64)
+            rt_log("lod: %s fades its own leaves: its start distance stays the game's (the settings' x%g is left out); %u "
+                   "such models so far", name, (double)f, kept);
+        return 1;
+    }
+    return f;
+}
+
 void lod_model_start_host(Cpu *c) {
     memcpy(&c->x[25], (const void *)(uintptr_t)(c->sp + 0x48), 8);
     settings();
-    const char *name = model_name(c);
-    static uint32_t named, kept;
-    if (name) named++;
-    if (self_fading(name)) {   // the game's start distance: its own coefficient over the factors that would raise it
-        float up = (factor[K_START] > 1 ? factor[K_START] : 1) * (k_model_start > 1 ? k_model_start : 1);
-        c->x[19] = scaled(c->x[19], (k_model_start < 1 ? k_model_start : 1) / (factor[K_START] > 1 ? factor[K_START] : 1),
-                          &n_model_start);
-        if (++kept <= 4 || kept == 64)
-            rt_log("lod: %s fades its own leaves: its start distance stays the game's (the settings' x%g is left out); %u "
-                   "such models so far, %u of %u models named", name, up, kept, named, n_models);
-        return;
-    }
-    c->x[19] = scaled(c->x[19], k_model_start, &n_model_start);
+    c->x[19] = scaled(c->x[19], model_start_factor(model_name(c)), &n_model_start);
 }
 
-// The patch page's two floats (+80, +84): 1.0 times the two model settings, for the models without a configuration.
+// A model without a configuration (main+0x897c0, where the game takes 1.0): most models of an area come this way.
+void lod_model_start_default_host(Cpu *c) {
+    settings();
+    static uint32_t calls;
+    float v = model_start_factor(model_name(c));
+    if (++calls == 256 || calls == 4096) rt_log("lod: models without a configuration: %u, start distance x%g on this one", calls, (double)v);
+    uint32_t bits;
+    memcpy(&bits, &v, 4);
+    c->x[19] = bits;
+}
+
+// The patch page's float at +80: 1.0 times the model max distance setting, for the models without a configuration.
 // The capacities of the foliage's GPU lists. The game's code sizes each list with a constant and its shaders carry
 // the same constant, and the offsets of the arrays behind a list: an entry past the capacity is dropped, and which
 // entries those are changes from frame to frame, so with the distances above raised the vegetation flickers.

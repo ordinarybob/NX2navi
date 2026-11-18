@@ -398,11 +398,12 @@ site lod main 2bf6010 2a1503e0 948aabb4   # mov w0, w21 -> bl page+0xee0 (lod_pl
 # and GameModelController_LodStartDistCoef in w19, 1.0 where the key is missing. With or without the key each value is
 # final at a `ldr x25, [sp, #0x48]` (main+0x8af20, main+0x8ab38), which goes to the host function (+0xed0, +0xec0); x30
 # is the function's saved one there, as it calls the name comparison in between. A model without a configuration
-# takes its 1.0 at main+0x897a0 and main+0x897c0: those read the page's +80 and +84, 1.0 times the setting.
+# takes its 1.0 at main+0x897a0, which reads the page's +80 (1.0 times the setting), and at main+0x897c0, which goes
+# to the host function at +0xe90: the trees that fade their own leaves need their name looked at there too.
 site lod main 8af20 f94027f9 953857ec   # ldr x25, [sp, #0x48] -> bl page+0xed0 (lod_model_max_host)
 site lod main 8ab38 f94027f9 953858e2   # ldr x25, [sp, #0x48] -> bl page+0xec0 (lod_model_start_host)
 site lod main 897a0 52a7f01b @page:x27 b940537b   # mov w27, #1.0 -> ldr w27, [page+80]
-site lod main 897c0 52a7f013 @page:x19 b9405673   # mov w19, #1.0 -> ldr w19, [page+84]
+site lod main 897c0 52a7f013 95385db4   # mov w19, #1.0 -> bl page+0xe90 (lod_model_start_default_host)
 site lod main 2bed698 2a1503e0 948ace02   # mov w0, w21 -> bl page+0xea0 (lod_foliage_host)
 
 # Foliage list capacities (runtime/lod.c lod_init, kCaps): the constants the list layouts are made with, loaded from

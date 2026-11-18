@@ -12,4 +12,5 @@ void lod_param_host(Cpu *c);         // patch page +0xf20
 void lod_plant_host(Cpu *c);         // +0xf50
 void lod_model_max_host(Cpu *c);     // +0xf40
 void lod_model_start_host(Cpu *c);   // +0xf30
+void lod_model_start_default_host(Cpu *c);   // a model without a configuration
 void lod_foliage_host(Cpu *c);       // +0xf10

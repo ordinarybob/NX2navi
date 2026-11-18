@@ -50,6 +50,7 @@ __attribute__((constructor)) static void lod_register(void) {
     rt_register_host(RT_PATCH_PAGE + 0xee0, lod_plant_host);
     rt_register_host(RT_PATCH_PAGE + 0xed0, lod_model_max_host);
     rt_register_host(RT_PATCH_PAGE + 0xec0, lod_model_start_host);
+    rt_register_host(RT_PATCH_PAGE + 0xe90, lod_model_start_default_host);
     rt_register_host(RT_PATCH_PAGE + 0xeb0, lod_param_host);
     rt_register_host(RT_PATCH_PAGE + 0xea0, lod_foliage_host);
 }
