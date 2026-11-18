@@ -281,7 +281,7 @@ static const CfgMeta metas[] = {
     {"HDR_GRADE", "100", "0..100", LIVE},
     {"DEVICE_PROFILE", "auto", "auto|desktop|deck", RESTART},
     // lod.c: Ocarina's level-of-detail distances
-    {"LOD_MAX_DIST", "100", "10..1000", LIVE}, {"LOD_START_DIST", "100", "10..1000", LIVE},
+    {"LOD_MAX_DIST", "100", "10..1000", LIVE}, {"LOD_START_DIST", "100", "10..1000", RESTART},
     {"LOD_START_DIST_HANDHELD", "100", "10..1000", LIVE}, {"LOD_STATIC_OFFSET", "0", "-100000..100000", LIVE},
     {"LOD_DYNAMIC_OFFSET", "0", "-100000..100000", LIVE}, {"MODEL_LOD_MAX_DIST", "100", "10..1000", RESTART},
     {"MODEL_LOD_START_DIST", "100", "10..1000", RESTART}, {"PLANT_DRAW_DIST", "game", "game|extended", RESTART},

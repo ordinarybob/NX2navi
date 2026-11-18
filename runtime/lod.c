@@ -19,7 +19,8 @@
 //
 // At 100, 0 and game a value stays what the game read. The GameLODParam and foliage settings are live: the objects the
 // game read are remembered with the game's own values, and lod_frame writes them again when a setting changes. The
-// model and plant settings act on what is loaded after they are set, so they take a restart.
+// model and plant settings act on what is loaded after they are set, so they take a restart, and so does
+// NX2NAVI_LOD_START_DIST: the trees that fade their own leaves are kept out of it as they load (kSelfFading).
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,7 +83,7 @@ static int read_live(void) {
     float f[K_N];
     f[K_NONE] = 1;
     f[K_MAX] = pct("NX2NAVI_LOD_MAX_DIST");
-    f[K_START] = pct("NX2NAVI_LOD_START_DIST");
+    f[K_START] = ready ? factor[K_START] : pct("NX2NAVI_LOD_START_DIST");   // as the run started: lod_model_start_host
     f[K_START_HH] = pct("NX2NAVI_LOD_START_DIST_HANDHELD");
     f[K_STATIC] = (float)cfg_int("NX2NAVI_LOD_STATIC_OFFSET");
     f[K_DYNAMIC] = (float)cfg_int("NX2NAVI_LOD_DYNAMIC_OFFSET");
@@ -261,9 +262,60 @@ void lod_model_max_host(Cpu *c) {
                n_model_max, n_model_start);
 }
 
+// Trees whose leaves fade themselves out. These models carry their leaves in the two nearer levels and a billboard in
+// the far one, and the leaves' material takes its alpha from a distance of its own, which ends where the game's own
+// start distance puts the billboard. A larger start distance keeps the near level in use past that distance: the
+// leaves have faded, the billboard is not drawn there, and the trunks stand bare (the spruces of Hyrule Field at
+// NX2NAVI_LOD_START_DIST = 400). They are the models with a shape named for a billboard; for them the start distance
+// stays the game's: their own coefficient is divided by the global factor, which is why that setting takes a restart.
+static const char *const kSelfFading[] = {
+    "Land_HrlCity_Middle_Tree_A_01", "Land_HrlField_Tree_A_01",         "Land_Kokiri_BillboardTree_A_01",
+    "Land_Kokiri_BillboardTree_A_02", "Land_LakeHrl_Tree_B_01",         "Land_LakeHrl_Tree_B_02",
+    "Land_Tree_GenericBroadleaf_C_01", "Land_Tree_GenericBroadleaf_C_02", "Land_ZoraFountain_Tree_A_06",
+    "Obj_Plant_Grass_A_02",           "Obj_Tree_A_01",
+};
+
+static uint64_t ptr_at(uint64_t at) { return at >= 0x10000 && !(at & 7) && plat_mem_readable(at, 8) ? load_q(at) : 0; }
+
+// The model's name where the reader of its configuration (main+0x89548) has it at the two sites: through the frame's
+// slot +0x48 (the object at its +0xa8, then that one's first pointer, the name at +0xec), or through x22 (+0x18, +0x58,
+// the name at +0x14). NULL when neither leads to a string.
+static const char *model_name(const Cpu *c) {
+    uint64_t at[2] = {ptr_at(ptr_at(ptr_at(c->x[29] + 0x48) + 0xa8)), ptr_at(ptr_at(c->x[22] + 0x18) + 0x58)};
+    static const uint32_t off[2] = {0xec, 0x14};
+    for (int i = 0; i < 2; i++) {
+        uint64_t a = at[i] ? at[i] + off[i] : 0;
+        if (!a || !plat_mem_readable(a, 64)) continue;
+        const char *t = (const char *)(uintptr_t)a;
+        int n = 0;
+        while (n < 63 && t[n] >= 0x20 && t[n] < 0x7f) n++;
+        if (n >= 4 && !t[n]) return t;
+    }
+    return NULL;
+}
+
+static int self_fading(const char *name) {
+    if (!name) return 0;
+    for (int i = 0; i < NF(kSelfFading); i++)
+        if (!strcmp(name, kSelfFading[i])) return 1;
+    return 0;
+}
+
 void lod_model_start_host(Cpu *c) {
     memcpy(&c->x[25], (const void *)(uintptr_t)(c->sp + 0x48), 8);
     settings();
+    const char *name = model_name(c);
+    static uint32_t named, kept;
+    if (name) named++;
+    if (self_fading(name)) {   // the game's start distance: its own coefficient over the factors that would raise it
+        float up = (factor[K_START] > 1 ? factor[K_START] : 1) * (k_model_start > 1 ? k_model_start : 1);
+        c->x[19] = scaled(c->x[19], (k_model_start < 1 ? k_model_start : 1) / (factor[K_START] > 1 ? factor[K_START] : 1),
+                          &n_model_start);
+        if (++kept <= 4 || kept == 64)
+            rt_log("lod: %s fades its own leaves: its start distance stays the game's (the settings' x%g is left out); %u "
+                   "such models so far, %u of %u models named", name, up, kept, named, n_models);
+        return;
+    }
     c->x[19] = scaled(c->x[19], k_model_start, &n_model_start);
 }
 
