@@ -277,11 +277,10 @@ static const char *const kSelfFading[] = {
 
 static uint64_t ptr_at(uint64_t at) { return at >= 0x10000 && !(at & 7) && plat_mem_readable(at, 8) ? load_q(at) : 0; }
 
-// The model's name where the reader of its configuration (main+0x89548) has it at the two sites: through the frame's
-// slot +0x48 (the object at its +0xa8, then that one's first pointer, the name at +0xec), or through x22 (+0x18, +0x58,
-// the name at +0x14). NULL when neither leads to a string.
-// The model's name at the two sites of the configuration's reader: from the model's own record (x22), and failing
-// that from the reader's frame, which at times still holds the model read before.
+// The model's name where the reader of its configuration (main+0x89548) has it at the two sites: through x22 (+0x18,
+// +0x58, the name at +0x14), the model's own record, and failing that through the frame's slot +0x48 (the object at
+// its +0xa8, then that one's first pointer, the name at +0xec), which at times still holds the model read before.
+// NULL when neither leads to a string.
 static const char *model_name(const Cpu *c) {
     uint64_t at[2] = {ptr_at(ptr_at(c->x[22] + 0x18) + 0x58), ptr_at(ptr_at(ptr_at(c->x[29] + 0x48) + 0xa8))};
     static const uint32_t off[2] = {0x14, 0xec};
@@ -303,36 +302,77 @@ static int self_fading(const char *name) {
     return 0;
 }
 
+// Whether the model at one of the reader's two sites fades its own leaves. The reader runs for every model the game
+// sets up, thousands of times a second while an area streams in, and the checked walk to the name (model_name) asks
+// the system about each address: that cost 4 ms a frame and hitches of a third of a second. So the answer is kept
+// per model record: x22 is the object the game itself reads at both sites, its +0x18 the model, whose +0x58 is the
+// record with the name at +0x14. A kept answer counts while the model still points at the same record and the
+// record's name starts with the same 16 bytes; those reads are checked against the runtime's own map of the guest's
+// memory (mem_readable), as x22 is not an object on every pass.
+typedef struct { uint64_t model, rec, name[2]; int fading; } NameMemo;
+static NameMemo memo[4096];
+static uint32_t n_calls, n_walks;
+static int model_self_fading(const Cpu *c, const char **name) {
+    *name = NULL;
+    n_calls++;
+    uint64_t obj = c->x[22];
+    if (obj < 0x10000 || (obj & 7) || !mem_readable(obj + 0x18, 8)) return 0;
+    uint64_t model = load_q(obj + 0x18);
+    if (model < 0x10000 || (model & 7) || !mem_readable(model + 0x58, 8)) return 0;
+    NameMemo *m = &memo[(uint32_t)((model >> 4) * 0x9e3779b1u) >> 20];
+    NameMemo e = *m;
+    if (e.model == model && e.rec) {
+        uint64_t rec = load_q(model + 0x58);
+        if (rec == e.rec && mem_readable(rec + 0x14, 16) && !memcmp((const void *)(uintptr_t)(rec + 0x14), e.name, 16))
+            return e.fading;
+    }
+    n_walks++;
+    const char *t = model_name(c);
+    uint64_t rec = ptr_at(model + 0x58);
+    e = (NameMemo){.model = model, .rec = 0};
+    if (t && rec && (uint64_t)(uintptr_t)t == rec + 0x14 && plat_mem_readable(rec + 0x14, 16)) {
+        e.rec = rec;
+        memcpy(e.name, t, 16);
+    }
+    e.fading = self_fading(t);
+    *m = e;
+    if (e.fading) *name = t;
+    return e.fading;
+}
+
 // The start distance settings as one model's factor. GameLODParam's two start coefficients stay the game's: raised
 // there they reach every model, and the trees that fade their own leaves (kSelfFading) then stand bare, among them
 // ones that never pass the reader of the model's configuration, where a model can be told by its name. So the
-// settings act here instead, on the models that pass that reader, and a self-fading one is not raised.
-static float model_start_factor(const char *name) {
+// settings act here instead, on the models that pass that reader, and a self-fading one is not raised. At or below
+// the game's distance no model is looked at.
+static float model_start_factor(const Cpu *c) {
     static int handheld = -1;
     if (handheld < 0) handheld = !strcmp(cfg_value("NX2NAVI_OPERATION_MODE"), "handheld");
     float f = k_model_start * factor[handheld ? K_START_HH : K_START];
+    if (f <= 1) return f;
+    const char *name;
+    if (!model_self_fading(c, &name)) return f;
     static uint32_t kept;
-    if (f > 1 && self_fading(name)) {
-        if (++kept <= 4 || kept == 64)
-            rt_log("lod: %s fades its own leaves: its start distance stays the game's (the settings' x%g is left out); %u "
-                   "such models so far", name, (double)f, kept);
-        return 1;
-    }
-    return f;
+    if (name && (++kept <= 4 || kept == 64))
+        rt_log("lod: %s fades its own leaves: its start distance stays the game's (the settings' x%g is left out); %u such "
+               "models so far; %u models asked, %u names walked", name, (double)f, kept, n_calls, n_walks);
+    return 1;
 }
 
 void lod_model_start_host(Cpu *c) {
     memcpy(&c->x[25], (const void *)(uintptr_t)(c->sp + 0x48), 8);
     settings();
-    c->x[19] = scaled(c->x[19], model_start_factor(model_name(c)), &n_model_start);
+    c->x[19] = scaled(c->x[19], model_start_factor(c), &n_model_start);
 }
 
 // A model without a configuration (main+0x897c0, where the game takes 1.0): most models of an area come this way.
 void lod_model_start_default_host(Cpu *c) {
     settings();
     static uint32_t calls;
-    float v = model_start_factor(model_name(c));
-    if (++calls == 256 || calls == 4096) rt_log("lod: models without a configuration: %u, start distance x%g on this one", calls, (double)v);
+    float v = model_start_factor(c);
+    if (++calls == 4096 || calls == 262144 || calls == 4194304)
+        rt_log("lod: models without a configuration: %u, start distance x%g on this one; %u models asked for their name, %u "
+               "names walked", calls, (double)v, n_calls, n_walks);
     uint32_t bits;
     memcpy(&bits, &v, 4);
     c->x[19] = bits;
